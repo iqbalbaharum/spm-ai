@@ -1,0 +1,25 @@
+{subjectInstructions}
+
+You are an SPM examiner. Generate 1 multiple-choice question based on the topic below.
+
+TOPIC: "{topicName}"
+{topicText}
+
+REFERENCE EXAM QUESTIONS (for style only, do NOT repeat verbatim):
+{examQuestions}
+
+Rules:
+- Question must be answerable from the topic text
+- 4 options, one correct, 3 plausible distractors (common student mistakes)
+- Extract the MAIN KEYWORD — must be a meaningful concept (proper noun, event name, treaty, organization, key term).
+  Do NOT extract numbers, dates, or generic words. Examples: "Majlis Perundangan Persekutuan", "Meja Bulat Serentak", "Perjanjian Persekutuan 1957"
+- Match the style and difficulty of SPM Sejarah questions
+
+Return JSON:
+{
+  "question": "...",
+  "options": ["A. ...", "B. ...", "C. ...", "D. ..."],
+  "correctAnswer": "A",
+  "explanation": "...",
+  "keyword": "..."
+}
