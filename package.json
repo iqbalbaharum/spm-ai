@@ -4,22 +4,27 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "mcp": "tsx src/mcp-server.ts",
     "dev": "tsx src/main.ts",
     "start": "node dist/main.js",
-    "build": "tsc"
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
-    "neo4j-driver": "^5.28.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "better-sqlite3": "^11.7.0",
-    "openai": "^4.86.0",
-    "dotenv": "^16.4.0",
     "chalk": "^5.4.0",
-    "commander": "^12.1.0"
+    "commander": "^12.1.0",
+    "dotenv": "^16.4.0",
+    "neo4j-driver": "^5.28.0",
+    "openai": "^4.86.0"
   },
   "devDependencies": {
-    "typescript": "^5.7.0",
     "@types/better-sqlite3": "^7.6.0",
     "@types/node": "^22.0.0",
-    "tsx": "^4.19.0"
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.7"
   }
 }

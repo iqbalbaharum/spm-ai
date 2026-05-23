@@ -12,12 +12,13 @@ const db = new Database(join(stageDir, "sessions.db"));
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS sessions (
-    id           TEXT PRIMARY KEY,
-    user_id      TEXT NOT NULL DEFAULT 'cli',
-    subject      TEXT NOT NULL DEFAULT 'Sejarah',
-    started_at   TEXT NOT NULL,
-    completed_at TEXT,
-    summary      TEXT NOT NULL DEFAULT '{}'
+    id             TEXT PRIMARY KEY,
+    user_id        TEXT NOT NULL DEFAULT 'cli',
+    subject        TEXT NOT NULL DEFAULT 'Sejarah',
+    started_at     TEXT NOT NULL,
+    completed_at   TEXT,
+    summary        TEXT NOT NULL DEFAULT '{}',
+    session_state  TEXT
   );
 
   CREATE TABLE IF NOT EXISTS question_logs (
@@ -76,6 +77,18 @@ export function saveQuestionLog(
     q.feedback.kbat,
     new Date().toISOString()
   );
+}
+
+export function saveSessionState(sessionId: string, state: unknown): void {
+  db.prepare("UPDATE sessions SET session_state = ? WHERE id = ?")
+    .run(JSON.stringify(state), sessionId);
+}
+
+export function loadSessionState(sessionId: string): unknown | null {
+  const row = db
+    .prepare("SELECT session_state FROM sessions WHERE id = ?")
+    .get(sessionId) as { session_state: string | null } | undefined;
+  return row?.session_state ? JSON.parse(row.session_state) : null;
 }
 
 export function completeSession(

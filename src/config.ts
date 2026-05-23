@@ -19,6 +19,8 @@ export const config = {
   subjectConfigs: subjectConfigsRaw as unknown as Record<string, SubjectConfig>,
 
   logLlm: (process.env.LOG_LLM || "off") as "off" | "truncated" | "full",
+
+  mcpLogRequests: process.env.MCP_LOG_REQUESTS === "on",
 };
 
 function missing(key: string): void {

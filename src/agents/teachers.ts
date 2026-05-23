@@ -141,7 +141,7 @@ async function generateOppositeSummary(
   return response.content;
 }
 
-function buildFeynmanPrompt(ctx: DialogueContext): string {
+export function buildFeynmanPrompt(ctx: DialogueContext): string {
   return feynmanPrompt
     .replace("{subjectInstructions}", ctx.subjectInstructions)
     .replace("{topic}", ctx.topic)
@@ -156,7 +156,7 @@ function buildFeynmanPrompt(ctx: DialogueContext): string {
     );
 }
 
-function buildStrictPrompt(ctx: DialogueContext): string {
+export function buildStrictPrompt(ctx: DialogueContext): string {
   return strictPrompt
     .replace("{subjectInstructions}", ctx.subjectInstructions)
     .replace("{topic}", ctx.topic)

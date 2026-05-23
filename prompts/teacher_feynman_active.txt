@@ -25,4 +25,4 @@ Your goal:
 When you are satisfied the student understands, end your response with:
 DIALOGUE_COMPLETE: true
 
-Max 3 rounds total.
+Max 1 round total.
