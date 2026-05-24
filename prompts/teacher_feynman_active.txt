@@ -22,7 +22,8 @@ Your goal:
 - Probe deeper with follow-up questions based on their response
 - Guide them toward a complete understanding
 
-When you are satisfied the student understands, end your response with:
-DIALOGUE_COMPLETE: true
-
-Max 1 round total.
+Respond in valid JSON format:
+{"message": "your response to the student"}
+- "message": natural conversation text. Do NOT use markdown formatting (no **bold**, *italic*, ```code```, etc.)
+- Max 1 round total.
+Respond with ONLY the JSON object, no other text.

@@ -13,7 +13,17 @@ vi.mock("../agents/teachers.js", () => ({
 }));
 
 vi.mock("../agents/llm.js", () => ({
-  callLLM: vi.fn(),
+  callLLMStructured: vi.fn(),
+  asTeacherResponse: vi.fn((raw: unknown) => {
+    if (raw && typeof raw === "object") {
+      const msg = (raw as Record<string, unknown>).message;
+      const cleaned = typeof msg === "string" && msg.length > 0
+        ? msg.replace(/[*_`\[]/g, "")
+        : "Terima kasih. Sila teruskan pembelajaran.";
+      return { message: cleaned };
+    }
+    return { message: "Terima kasih. Sesi diteruskan." };
+  }),
 }));
 
 vi.mock("../db/neo4j.js", () => ({
@@ -50,7 +60,7 @@ import {
 
 import { generateMCQ } from "../agents/generator.js";
 import { buildFeynmanPrompt, buildStrictPrompt, passiveFeedback, passiveSummaries } from "../agents/teachers.js";
-import { callLLM } from "../agents/llm.js";
+import { callLLMStructured } from "../agents/llm.js";
 import { getParetoTopics, getTopicWithQuestions } from "../db/neo4j.js";
 import { createSession, saveQuestionLog, completeSession, getSessionDetail } from "../db/sqlite.js";
 
@@ -232,9 +242,8 @@ describe("MCP Server", () => {
 
     it("should start Feynman dialogue on correct answer", async () => {
       (buildFeynmanPrompt as Mock).mockReturnValue("feynman system prompt");
-      (callLLM as Mock).mockResolvedValue({
-        content: "Great! Tell me about Kemerdekaan.",
-        dialogueComplete: false,
+      (callLLMStructured as Mock).mockResolvedValue({
+        message: "Great! Tell me about Kemerdekaan.",
       });
 
       const result = await handleAnswerLoop({ session_id: testSessionId, answer: "B" });
@@ -256,9 +265,8 @@ describe("MCP Server", () => {
 
     it("should start Strict dialogue on wrong answer", async () => {
       (buildStrictPrompt as Mock).mockReturnValue("strict system prompt");
-      (callLLM as Mock).mockResolvedValue({
-        content: "The correct answer is B.",
-        dialogueComplete: false,
+      (callLLMStructured as Mock).mockResolvedValue({
+        message: "The correct answer is B.",
       });
 
       const result = await handleAnswerLoop({ session_id: testSessionId, answer: "A" });
@@ -277,116 +285,42 @@ describe("MCP Server", () => {
       expect(state.correct).toBe(false);
     });
 
-    it("should complete session immediately when LLM signals dialogueComplete on first call", async () => {
+    it("should complete session after first student dialogue reply", async () => {
       (buildFeynmanPrompt as Mock).mockReturnValue("feynman system prompt");
-      (callLLM as Mock).mockResolvedValue({
-        content: "All done!",
-        dialogueComplete: true,
-      });
-      (passiveFeedback as Mock).mockResolvedValue("feedback content");
-      (passiveSummaries as Mock).mockResolvedValue({
-        strict: "strict summary",
-        feynman: "feynman summary",
+      (callLLMStructured as Mock).mockResolvedValueOnce({
+        message: "Tell me more!",
       });
 
-      const result = await handleAnswerLoop({ session_id: testSessionId, answer: "B" });
-      const { isError, data } = parseToolResponse(result);
+      const first = await handleAnswerLoop({ session_id: testSessionId, answer: "B" });
+      const { data: firstData } = parseToolResponse(first);
+      expect(firstData.completed).toBe(false);
+      expect(firstData.response).toBe("Tell me more!");
+      expect(firstData.teacher).toBe("feynman");
+
+      (passiveFeedback as Mock).mockResolvedValue("feedback content");
+      (passiveSummaries as Mock).mockResolvedValue({ strict: "s", feynman: "f" });
+
+      const second = await handleAnswerLoop({
+        session_id: testSessionId,
+        answer: "I understand now.",
+      });
+      const { isError, data } = parseToolResponse(second);
 
       expect(isError).toBeFalsy();
       expect(data.completed).toBe(true);
       expect(data.feedback).toBeDefined();
-      expect(data.feedback.strict).toBe("strict summary");
-      expect(data.feedback.feynman).toBe("feynman summary");
       expect(data.summary).toBeDefined();
+      expect(data.response).toContain("─── Feedback Summary ───");
+      expect(data.response).toContain("[Strict Summary]");
+      expect(data.response).toContain("[Recap]");
 
+      expect(callLLMStructured).toHaveBeenCalledTimes(1);
       expect(saveQuestionLog).toHaveBeenCalledOnce();
       expect(completeSession).toHaveBeenCalledOnce();
 
       const state = sessions.get(testSessionId)!;
       expect(state.status).toBe("complete");
-    });
-
-    it("should continue dialogue on subsequent calls", async () => {
-      // Use wrong answer so Strict teacher is activated (still allows 3 rounds)
-      (buildStrictPrompt as Mock).mockReturnValue("strict system prompt");
-      (callLLM as Mock).mockResolvedValueOnce({
-        content: "The correct answer is B.",
-        dialogueComplete: false,
-      });
-
-      await handleAnswerLoop({ session_id: testSessionId, answer: "A" });
-
-      (callLLM as Mock).mockResolvedValueOnce({
-        content: "That's interesting!",
-        dialogueComplete: false,
-      });
-
-      const result = await handleAnswerLoop({
-        session_id: testSessionId,
-        answer: "The independence was in 1957.",
-      });
-      const { isError, data } = parseToolResponse(result);
-
-      expect(isError).toBeFalsy();
-      expect(data.completed).toBe(false);
-      expect(data.response).toBe("That's interesting!");
-
-      const state = sessions.get(testSessionId)!;
       expect(state.rounds).toBe(1);
-      expect(state.messages).toHaveLength(5);
-    });
-
-    it("should complete session when dialogueComplete is true on subsequent call", async () => {
-      (buildFeynmanPrompt as Mock).mockReturnValue("feynman system prompt");
-      (callLLM as Mock).mockResolvedValueOnce({
-        content: "Tell me more!",
-        dialogueComplete: false,
-      });
-      await handleAnswerLoop({ session_id: testSessionId, answer: "B" });
-
-      (callLLM as Mock).mockResolvedValueOnce({
-        content: "Great session!",
-        dialogueComplete: true,
-      });
-      (passiveFeedback as Mock).mockResolvedValue("feedback");
-      (passiveSummaries as Mock).mockResolvedValue({ strict: "s", feynman: "f" });
-
-      const result = await handleAnswerLoop({
-        session_id: testSessionId,
-        answer: "I understand now.",
-      });
-      const { isError, data } = parseToolResponse(result);
-
-      expect(isError).toBeFalsy();
-      expect(data.completed).toBe(true);
-    });
-
-    it("should auto-complete when max rounds reached", async () => {
-      (buildFeynmanPrompt as Mock).mockReturnValue("feynman system prompt");
-      (callLLM as Mock).mockResolvedValueOnce({
-        content: "Tell me more!",
-        dialogueComplete: false,
-      });
-      await handleAnswerLoop({ session_id: testSessionId, answer: "B" });
-
-      const state = sessions.get(testSessionId)!;
-      state.rounds = 2;
-
-      (callLLM as Mock).mockResolvedValueOnce({
-        content: "Last round!",
-        dialogueComplete: false,
-      });
-      (passiveFeedback as Mock).mockResolvedValue("feedback");
-      (passiveSummaries as Mock).mockResolvedValue({ strict: "s", feynman: "f" });
-
-      const result = await handleAnswerLoop({
-        session_id: testSessionId,
-        answer: "I understand.",
-      });
-      const { isError, data } = parseToolResponse(result);
-
-      expect(isError).toBeFalsy();
-      expect(data.completed).toBe(true);
     });
   });
 });

@@ -87,3 +87,7 @@ export interface TopicWithQuestions {
   text: string;
   examQuestions: string[];
 }
+
+export interface TeacherResponse {
+  message: string;
+}

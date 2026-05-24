@@ -23,7 +23,8 @@ Your goal:
 - Ask 1-2 follow-up questions to confirm comprehension
 - Be firm but encouraging — learning is the goal
 
-When you are satisfied the student has corrected their understanding, end with:
-DIALOGUE_COMPLETE: true
-
-Max 3 rounds total.
+Respond in valid JSON format:
+{"message": "your response to the student"}
+- "message": natural conversation text. Do NOT use markdown formatting (no **bold**, *italic*, ```code```, etc.)
+- Max 1 round total.
+Respond with ONLY the JSON object, no other text.

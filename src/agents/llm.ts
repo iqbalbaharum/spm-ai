@@ -3,7 +3,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import OpenAI from "openai";
 import { config } from "../config.js";
-import type { ChatMessage, LLMResponse, LLMOptions } from "../types.js";
+import type { ChatMessage, LLMResponse, LLMOptions, TeacherResponse } from "../types.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const logDir = join(__dirname, "../../.stage/llm");
@@ -50,8 +50,8 @@ export function logEvent(
 
   try {
     appendFileSync(join(logDir, `${sessionId}.jsonl`), JSON.stringify(payload) + "\n", "utf-8");
-  } catch {
-    // silent
+  } catch (e) {
+    console.error("LLM log write failed:", e);
   }
 }
 
@@ -91,22 +91,60 @@ export async function callLLMStructured<T>(
   messages: ChatMessage[],
   options?: LLMOptions
 ): Promise<T> {
-  logEvent(options?.sessionId, "in", { messages });
+  const maxAttempts = 2;
 
-  const resp = await client.chat.completions.create({
-    model: options?.model || config.openrouterModel,
-    messages,
-    max_tokens: 2048,
-    response_format: { type: "json_object" },
-  });
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      logEvent(options?.sessionId, "in", { attempt, messages });
 
-  const content = resp.choices[0]?.message?.content?.trim() || "";
+      const resp = await client.chat.completions.create({
+        model: options?.model || config.openrouterModel,
+        messages,
+        max_tokens: 2048,
+        response_format: { type: "json_object" },
+      });
 
-  const usage = resp.usage
-    ? { prompt_tokens: resp.usage.prompt_tokens, completion_tokens: resp.usage.completion_tokens }
-    : undefined;
+      let content = resp.choices[0]?.message?.content?.trim() || "";
 
-  logEvent(options?.sessionId, "out", { content, usage });
+      content = content
+        .replace(/^```(?:json)?\s*\n?/m, "")
+        .replace(/\n?```\s*$/m, "")
+        .trim();
 
-  return JSON.parse(content) as T;
+      const usage = resp.usage
+        ? { prompt_tokens: resp.usage.prompt_tokens, completion_tokens: resp.usage.completion_tokens }
+        : undefined;
+
+      logEvent(options?.sessionId, "out", { content, usage });
+
+      return JSON.parse(content) as T;
+    } catch (err) {
+      if (attempt === maxAttempts) throw err;
+
+      await new Promise(r => setTimeout(r, 200));
+
+      const detail = err instanceof SyntaxError
+        ? `JSON parse error: ${err.message}`
+        : `Error: ${err instanceof Error ? err.message : String(err)}`;
+
+      messages = [
+        ...messages,
+        { role: "assistant", content: "[Response format was invalid]" },
+        { role: "user", content: `Your previous response could not be parsed. ${detail} Please respond with ONLY a valid JSON object with the required fields. Do NOT include markdown code fences.` },
+      ];
+    }
+  }
+
+  throw new Error("callLLMStructured exhausted retries");
+}
+
+export function asTeacherResponse(raw: unknown): TeacherResponse {
+  if (raw && typeof raw === "object") {
+    const msg = (raw as Record<string, unknown>).message;
+    const cleaned = typeof msg === "string" && msg.length > 0
+      ? msg.replace(/[*_`\[]/g, "")
+      : "Terima kasih. Sila teruskan pembelajaran.";
+    return { message: cleaned };
+  }
+  return { message: "Terima kasih. Sesi diteruskan." };
 }

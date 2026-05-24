@@ -17,7 +17,7 @@ import {
   passiveFeedback,
   passiveSummaries,
 } from "./agents/teachers.js";
-import { callLLM } from "./agents/llm.js";
+import { callLLMStructured, asTeacherResponse } from "./agents/llm.js";
 import { getParetoTopics, getTopicWithQuestions, closeDb } from "./db/neo4j.js";
 import {
   createSession,
@@ -88,6 +88,8 @@ function buildDialogueContext(state: SessionState): DialogueContext {
   };
 }
 
+const MAX_ROUNDS = 1;
+
 async function completeSessionAndGetResult(
   state: SessionState
 ): Promise<Record<string, unknown>> {
@@ -95,16 +97,10 @@ async function completeSessionAndGetResult(
   const activeTeacher = state.activeTeacher;
 
   let recap = "";
-  let kbat = "";
   try {
     recap = await passiveFeedback("recap", ctx);
   } catch {
     recap = "(feedback unavailable)";
-  }
-  try {
-    kbat = await passiveFeedback("kbat", ctx);
-  } catch {
-    kbat = "(feedback unavailable)";
   }
 
   let summaries = { strict: "", feynman: "" };
@@ -127,12 +123,18 @@ async function completeSessionAndGetResult(
     strict: summaries.strict,
     feynman: summaries.feynman,
     recap,
-    kbat,
+    kbat: "",
   };
 
-  const lastAssistantMsg = [...state.messages]
-    .reverse()
-    .find((m) => m.role === "assistant");
+  const finalResponse = [
+    `─── Feedback Summary ───`,
+    ``,
+    `  [Strict Summary]`,
+    `  ${summaries.strict}`,
+    ``,
+    `  [Recap]`,
+    `  ${recap}`,
+  ].join("\n");
 
   const record: QuestionRecord = {
     seq: 1,
@@ -158,7 +160,7 @@ async function completeSessionAndGetResult(
 
   return {
     completed: true,
-    response: lastAssistantMsg?.content || "",
+    response: finalResponse,
     teacher: activeTeacher,
     feedback,
     summary,
@@ -357,25 +359,22 @@ export async function handleAnswerLoop(args: Record<string, unknown>) {
       { role: "user", content: initialUserContent },
     ];
 
-    const response = await callLLM(state.messages, {
+    const raw = await callLLMStructured<unknown>(state.messages, {
       sessionId: state.sessionId,
     });
+    const teacherMsg = asTeacherResponse(raw);
     state.messages.push({
       role: "assistant",
-      content: response.content,
+      content: teacherMsg.message,
     });
     saveSessionState(state.sessionId, state);
-
-    if (response.dialogueComplete) {
-      return asToolResponse(await completeSessionAndGetResult(state));
-    }
 
     state.status = "in-dialogue";
     state.rounds = 0;
 
     return asToolResponse({
       completed: false,
-      response: response.content,
+      response: teacherMsg.message,
       teacher: state.activeTeacher,
     });
   }
@@ -385,25 +384,23 @@ export async function handleAnswerLoop(args: Record<string, unknown>) {
 
     state.messages.push({ role: "user", content: answer });
 
-    const response = await callLLM(state.messages, {
-      sessionId: state.sessionId,
-    });
-    state.messages.push({
-      role: "assistant",
-      content: response.content,
-    });
-    saveSessionState(state.sessionId, state);
-
-    if (
-      response.dialogueComplete ||
-      state.rounds >= (state.activeTeacher === "feynman" ? 1 : config.maxActiveRounds)
-    ) {
+    if (state.rounds >= MAX_ROUNDS) {
       return asToolResponse(await completeSessionAndGetResult(state));
     }
 
+    const raw = await callLLMStructured<unknown>(state.messages, {
+      sessionId: state.sessionId,
+    });
+    const teacherMsg = asTeacherResponse(raw);
+    state.messages.push({
+      role: "assistant",
+      content: teacherMsg.message,
+    });
+    saveSessionState(state.sessionId, state);
+
     return asToolResponse({
       completed: false,
-      response: response.content,
+      response: teacherMsg.message,
     });
   }
 
