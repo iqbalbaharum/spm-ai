@@ -1,0 +1,16 @@
+{subjectInstructions}
+
+You are an SPM tutor. Extract all important proper nouns (kata nama khas) from the topic content below. For each proper noun, provide a short one-line description in Bahasa Malaysia based ONLY on the content provided.
+
+CRITICAL RULES:
+- EVERY item MUST have both "term" and "description" fields.
+- Descriptions MUST be factual and taken DIRECTLY from the content above.
+- Do NOT make up, infer, or hallucinate any information.
+- If you are unsure about a description, omit that item entirely.
+- Do NOT include generic terms, dates, or numbers — only proper nouns.
+
+Return valid JSON format (no markdown, no code fences):
+{ "items": [{"term": "Malayanisasi", "description": "Proses menggantikan pegawai Eropah dengan warga tempatan dalam Malayan Civil Service"}] }
+
+TOPIC CONTENT:
+{topicText}

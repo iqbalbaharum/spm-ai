@@ -10,6 +10,7 @@ vi.mock("../agents/teachers.js", () => ({
   buildStrictPrompt: vi.fn(),
   passiveFeedback: vi.fn(),
   passiveSummaries: vi.fn(),
+  extractProperNouns: vi.fn(),
 }));
 
 vi.mock("../agents/llm.js", () => ({
@@ -59,7 +60,7 @@ import {
 } from "../mcp-server.js";
 
 import { generateMCQ } from "../agents/generator.js";
-import { buildFeynmanPrompt, buildStrictPrompt, passiveFeedback, passiveSummaries } from "../agents/teachers.js";
+import { buildFeynmanPrompt, buildStrictPrompt, passiveFeedback, passiveSummaries, extractProperNouns } from "../agents/teachers.js";
 import { callLLMStructured } from "../agents/llm.js";
 import { getParetoTopics, getTopicWithQuestions } from "../db/neo4j.js";
 import { createSession, saveQuestionLog, completeSession, getSessionDetail } from "../db/sqlite.js";
@@ -226,6 +227,7 @@ describe("MCP Server", () => {
           feedback_feynman: "feynman summary",
           feedback_recap: "recap feedback",
           feedback_kbat: "kbat feedback",
+          feedback_propernouns: "• Tunku Abdul Rahman — Ketua Menteri pertama",
         }],
       });
 
@@ -299,6 +301,9 @@ describe("MCP Server", () => {
 
       (passiveFeedback as Mock).mockResolvedValue("feedback content");
       (passiveSummaries as Mock).mockResolvedValue({ strict: "s", feynman: "f" });
+      (extractProperNouns as Mock).mockResolvedValue(
+        "• Tunku Abdul Rahman — Ketua Menteri pertama\n• V.T. Sambanthan — Menteri Buruh"
+      );
 
       const second = await handleAnswerLoop({
         session_id: testSessionId,
@@ -310,8 +315,10 @@ describe("MCP Server", () => {
       expect(data.completed).toBe(true);
       expect(data.feedback).toBeDefined();
       expect(data.summary).toBeDefined();
+      expect(data.feedback.propernouns).toContain("Tunku Abdul Rahman");
       expect(data.response).toContain("─── Feedback Summary ───");
       expect(data.response).toContain("[Strict Summary]");
+      expect(data.response).toContain("[Kata Nama Khas]");
       expect(data.response).toContain("[Recap]");
 
       expect(callLLMStructured).toHaveBeenCalledTimes(1);
@@ -321,6 +328,35 @@ describe("MCP Server", () => {
       const state = sessions.get(testSessionId)!;
       expect(state.status).toBe("complete");
       expect(state.rounds).toBe(1);
+    });
+
+    it("should omit Kata Nama Khas section when no proper nouns extracted", async () => {
+      (buildFeynmanPrompt as Mock).mockReturnValue("feynman system prompt");
+      (callLLMStructured as Mock).mockResolvedValueOnce({
+        message: "Tell me more!",
+      });
+
+      const first = await handleAnswerLoop({ session_id: testSessionId, answer: "B" });
+      const { data: firstData } = parseToolResponse(first);
+      expect(firstData.completed).toBe(false);
+
+      (passiveFeedback as Mock).mockResolvedValue("feedback content");
+      (passiveSummaries as Mock).mockResolvedValue({ strict: "s", feynman: "f" });
+      (extractProperNouns as Mock).mockResolvedValue("");
+
+      const second = await handleAnswerLoop({
+        session_id: testSessionId,
+        answer: "I understand now.",
+      });
+      const { isError, data } = parseToolResponse(second);
+
+      expect(isError).toBeFalsy();
+      expect(data.completed).toBe(true);
+      expect(data.feedback.propernouns).toBe("");
+      expect(data.response).toContain("─── Feedback Summary ───");
+      expect(data.response).toContain("[Strict Summary]");
+      expect(data.response).toContain("[Recap]");
+      expect(data.response).not.toContain("[Kata Nama Khas]");
     });
   });
 });

@@ -121,8 +121,6 @@ export async function callLLMStructured<T>(
     } catch (err) {
       if (attempt === maxAttempts) throw err;
 
-      await new Promise(r => setTimeout(r, 200));
-
       const detail = err instanceof SyntaxError
         ? `JSON parse error: ${err.message}`
         : `Error: ${err instanceof Error ? err.message : String(err)}`;

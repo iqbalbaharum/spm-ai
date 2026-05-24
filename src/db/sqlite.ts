@@ -35,9 +35,17 @@ db.exec(`
     feedback_feynman TEXT,
     feedback_recap   TEXT,
     feedback_kbat    TEXT,
+    feedback_propernouns TEXT,
     created_at       TEXT NOT NULL
   );
 `);
+
+// Migration: add feedback_propernouns column for existing databases
+try {
+  db.exec("ALTER TABLE question_logs ADD COLUMN feedback_propernouns TEXT");
+} catch {
+  // column already exists — safe to ignore
+}
 
 export function createSession(
   sessionId: string,
@@ -58,8 +66,8 @@ export function saveQuestionLog(
     INSERT INTO question_logs
       (session_id, seq, topic, mcq, student_answer, correct,
        active_teacher, dialogue, feedback_strict, feedback_feynman,
-       feedback_recap, feedback_kbat, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       feedback_recap, feedback_kbat, feedback_propernouns, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   stmt.run(
@@ -75,6 +83,7 @@ export function saveQuestionLog(
     q.feedback.feynman,
     q.feedback.recap,
     q.feedback.kbat,
+    q.feedback.propernouns,
     new Date().toISOString()
   );
 }

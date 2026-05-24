@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { callLLM } from "./llm.js";
+import { callLLM, callLLMStructured } from "./llm.js";
 import { config } from "../config.js";
 import type {
   ChatMessage,
@@ -21,6 +21,7 @@ const feynmanPrompt = loadPrompt("teacher_feynman_active.txt");
 const strictPrompt = loadPrompt("teacher_strict_active.txt");
 const recapPrompt = loadPrompt("teacher_recap_passive.txt");
 const kbatPrompt = loadPrompt("teacher_kbat_passive.txt");
+const propernounsPrompt = loadPrompt("teacher_propernouns_passive.txt");
 
 export async function activeDialogue(
   teacher: "feynman" | "strict",
@@ -92,6 +93,47 @@ export async function passiveFeedback(
   );
 
   return response.content;
+}
+
+interface ProperNounsItem {
+  term: string;
+  description: string;
+}
+
+export async function extractProperNouns(
+  ctx: DialogueContext
+): Promise<string> {
+  const filled = propernounsPrompt
+    .replace("{subjectInstructions}", ctx.subjectInstructions)
+    .replace("{topicText}", ctx.topicText);
+
+  try {
+    const result = await callLLMStructured<{ items: ProperNounsItem[] }>(
+      [
+        { role: "system", content: filled },
+        { role: "user", content: "Extract proper nouns." },
+      ],
+      { sessionId: ctx.sessionId }
+    );
+
+    const validItems = (result.items || []).filter(
+      (item) =>
+        item &&
+        typeof item.term === "string" &&
+        item.term.trim().length > 0 &&
+        typeof item.description === "string" &&
+        item.description.trim().length > 0 &&
+        item.description.trim() !== "undefined"
+    );
+
+    if (validItems.length === 0) return "";
+
+    return validItems
+      .map((item) => `• ${item.term.trim()} — ${item.description.trim()}`)
+      .join("\n");
+  } catch {
+    return "";
+  }
 }
 
 export async function passiveSummaries(

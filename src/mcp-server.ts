@@ -16,6 +16,7 @@ import {
   buildStrictPrompt,
   passiveFeedback,
   passiveSummaries,
+  extractProperNouns,
 } from "./agents/teachers.js";
 import { callLLMStructured, asTeacherResponse } from "./agents/llm.js";
 import { getParetoTopics, getTopicWithQuestions, closeDb } from "./db/neo4j.js";
@@ -119,22 +120,35 @@ async function completeSessionAndGetResult(
     };
   }
 
+  let propernouns = "";
+  try {
+    propernouns = await extractProperNouns(ctx);
+  } catch {
+    propernouns = "";
+  }
+
   const feedback: PassiveFeedback = {
     strict: summaries.strict,
     feynman: summaries.feynman,
     recap,
     kbat: "",
+    propernouns,
   };
 
-  const finalResponse = [
+  const finalParts = [
     `─── Feedback Summary ───`,
     ``,
     `  [Strict Summary]`,
     `  ${summaries.strict}`,
-    ``,
-    `  [Recap]`,
-    `  ${recap}`,
-  ].join("\n");
+  ];
+
+  if (propernouns) {
+    finalParts.push(``, `  [Kata Nama Khas]`, `  ${propernouns}`);
+  }
+
+  finalParts.push(``, `  [Recap]`, `  ${recap}`);
+
+  const finalResponse = finalParts.join("\n");
 
   const record: QuestionRecord = {
     seq: 1,
@@ -201,6 +215,7 @@ function reconstructCompletedResponse(sessionId: string): Record<string, unknown
       feynman: q.feedback_feynman,
       recap: q.feedback_recap,
       kbat: q.feedback_kbat,
+      propernouns: q.feedback_propernouns,
     },
     summary: typeof detail.session.summary === "string"
       ? JSON.parse(detail.session.summary)

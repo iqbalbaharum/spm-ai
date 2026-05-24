@@ -46,6 +46,7 @@ export interface PassiveFeedback {
   feynman: string;
   recap: string;
   kbat: string;
+  propernouns: string;
 }
 
 export interface QuestionRecord {

@@ -120,7 +120,6 @@ export async function generateMCQ(input: GeneratorInput): Promise<MCQ> {
       throw new Error(`Failed to generate valid MCQ after ${maxAttempts} attempts`);
     }
 
-    await new Promise(r => setTimeout(r, 200));
   }
 
   const rawOut = raw!;

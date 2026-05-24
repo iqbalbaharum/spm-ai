@@ -1,6 +1,6 @@
 import chalk from "chalk";
 import { generateMCQ } from "./generator.js";
-import { activeDialogue, passiveFeedback, passiveSummaries } from "./teachers.js";
+import { activeDialogue, passiveFeedback, passiveSummaries, extractProperNouns } from "./teachers.js";
 import { getParetoTopics, getTopicWithQuestions } from "../db/neo4j.js";
 import { createSession, saveQuestionLog, completeSession } from "../db/sqlite.js";
 import { config } from "../config.js";
@@ -84,7 +84,7 @@ export async function runQuiz(
         correct: null,
         activeTeacher: null,
         dialogue: [],
-        feedback: { strict: "", feynman: "", recap: "", kbat: "" },
+        feedback: { strict: "", feynman: "", recap: "", kbat: "", propernouns: "" },
       });
       console.log(chalk.yellow("  Skipped.\n"));
       continue;
@@ -108,12 +108,13 @@ export async function runQuiz(
 
     console.log(chalk.dim("\n  ─── Feedback Summary ───\n"));
 
-    const [passive, summaries] = await Promise.all([
+    const [passive, summaries, propernouns] = await Promise.all([
       Promise.all([
         passiveFeedback("recap", ctx),
         passiveFeedback("kbat", ctx),
       ]),
       passiveSummaries(activeTeacher, ctx),
+      extractProperNouns(ctx).catch(() => "(feedback unavailable)"),
     ]);
 
     const [recap, kbat] = passive;
@@ -122,6 +123,7 @@ export async function runQuiz(
       feynman: summaries.feynman,
       recap,
       kbat,
+      propernouns,
     };
 
     displayFeedback(activeTeacher, feedback);
@@ -181,6 +183,11 @@ function displayFeedback(
 
   console.log(chalk.dim(`  [Recap]`));
   console.log(`  ${feedback.recap}\n`);
+
+  if (feedback.propernouns) {
+    console.log(chalk.dim(`  [Kata Nama Khas]`));
+    console.log(`  ${feedback.propernouns}\n`);
+  }
 
   console.log(chalk.dim(`  [KBAT]`));
   console.log(`  ${feedback.kbat}\n`);
