@@ -1,13 +1,6 @@
-import { appendFileSync, mkdirSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
 import OpenAI from "openai";
 import { config } from "../config.js";
 import type { ChatMessage, LLMResponse, LLMOptions, TeacherResponse } from "../types.js";
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const logDir = join(__dirname, "../../.stage/llm");
-mkdirSync(logDir, { recursive: true });
 
 const client = new OpenAI({
   baseURL: config.openrouterBaseUrl,
@@ -48,11 +41,7 @@ export function logEvent(
     payload = truncateDeep(payload, 500) as Record<string, unknown>;
   }
 
-  try {
-    appendFileSync(join(logDir, `${sessionId}.jsonl`), JSON.stringify(payload) + "\n", "utf-8");
-  } catch (e) {
-    console.error("LLM log write failed:", e);
-  }
+  process.stderr.write(JSON.stringify(payload) + "\n");
 }
 
 export async function callLLM(
