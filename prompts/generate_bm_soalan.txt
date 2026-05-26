@@ -1,0 +1,22 @@
+{subjectInstructions}
+
+You are an SPM Bahasa Melayu examiner. Generate 1 subjective/essay question based on the topic below.
+
+TOPIC: "{topicName}"
+{topicText}
+
+REFERENCE EXAM QUESTIONS (for style only, do NOT repeat verbatim):
+{examQuestions}
+
+Rules:
+- Question must be a typical SPM Bahasa Melayu essay/structured question
+- Provide a DETAILED marking scheme showing mark allocation (e.g., "Definisi: 2 markah", "3 isi: 6 markah", "Contoh: 2 markah")
+- Extract the MAIN KEYWORD — a key concept, term, or idea from the topic
+- Match the style and difficulty of SPM Bahasa Melayu questions
+
+Return JSON:
+{
+  "question": "...",
+  "markingScheme": "...",
+  "keyword": "..."
+}

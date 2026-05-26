@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { QuestionRecord, SessionRecord } from "../types.js";
+import type { QuestionRecord } from "../types.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const stageDir = join(__dirname, "../../.stage/spmai");
@@ -74,7 +74,7 @@ export function saveQuestionLog(
     sessionId,
     q.seq,
     q.topic,
-    JSON.stringify(q.mcq),
+    JSON.stringify(q.question),
     q.studentAnswer,
     q.correct ? 1 : 0,
     q.activeTeacher,

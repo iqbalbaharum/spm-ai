@@ -2,12 +2,12 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { Mock } from "vitest";
 
 vi.mock("../agents/generator.js", () => ({
-  generateMCQ: vi.fn(),
+  generateQuestion: vi.fn(),
 }));
 
 vi.mock("../agents/teachers.js", () => ({
-  buildFeynmanPrompt: vi.fn(),
-  buildStrictPrompt: vi.fn(),
+  buildTeacherPrompt: vi.fn(),
+  evaluateSubjective: vi.fn(),
   passiveFeedback: vi.fn(),
   passiveSummaries: vi.fn(),
   extractProperNouns: vi.fn(),
@@ -44,7 +44,17 @@ vi.mock("../db/sqlite.js", () => ({
 vi.mock("../config.js", () => ({
   config: {
     subjectConfigs: {
-      sejarah: { language: "Bahasa Malaysia", instructions: "Test instructions" },
+      sejarah: {
+        language: "Bahasa Malaysia",
+        instructions: "Test instructions",
+        mode: "mcq",
+        teachers: {
+          feynman: { displayName: "Feynman", prompt: "teacher_feynman_active.txt" },
+          strict: { displayName: "Strict", prompt: "teacher_strict_active.txt" },
+        },
+        passiveFeedback: ["recap", "propernouns"],
+        prompts: { generate: "generate_quiz.txt" },
+      },
     },
     paretoPercent: 0.2,
     maxActiveRounds: 3,
@@ -59,8 +69,8 @@ import {
   sessions,
 } from "../mcp-server.js";
 
-import { generateMCQ } from "../agents/generator.js";
-import { buildFeynmanPrompt, buildStrictPrompt, passiveFeedback, passiveSummaries, extractProperNouns } from "../agents/teachers.js";
+import { generateQuestion } from "../agents/generator.js";
+import { buildTeacherPrompt, evaluateSubjective, passiveFeedback, passiveSummaries, extractProperNouns } from "../agents/teachers.js";
 import { callLLMStructured } from "../agents/llm.js";
 import { getParetoTopics, getTopicWithQuestions } from "../db/neo4j.js";
 import { createSession, saveQuestionLog, completeSession, getSessionDetail } from "../db/sqlite.js";
@@ -81,7 +91,7 @@ const mockTopicWithQuestions = {
 
 const mockMCQ = {
   question: "Bilakah Tanah Melayu mencapai kemerdekaan?",
-  options: ["1955", "1957", "1963", "1965"] as [string, string, string, string],
+  options: ["A. 1955", "B. 1957", "C. 1963", "D. 1965"] as [string, string, string, string],
   correctAnswer: "B" as const,
   explanation: "Tanah Melayu achieved independence on 31 August 1957.",
   keyword: "Kemerdekaan",
@@ -115,7 +125,7 @@ describe("MCP Server", () => {
     it("should return a question for a valid subject", async () => {
       (getParetoTopics as Mock).mockResolvedValue([mockTopicSummary]);
       (getTopicWithQuestions as Mock).mockResolvedValue(mockTopicWithQuestions);
-      (generateMCQ as Mock).mockResolvedValue(mockMCQ);
+      (generateQuestion as Mock).mockResolvedValue(mockMCQ);
 
       const result = await handleGetQuestion({ subject: "sejarah" });
       const { isError, data } = parseToolResponse(result);
@@ -127,13 +137,14 @@ describe("MCP Server", () => {
       expect(data.options).toEqual(mockMCQ.options);
       expect(data.keyword).toBe(mockMCQ.keyword);
       expect(data.topic).toBe(mockTopicSummary.name);
+      expect(data.mode).toBe("mcq");
 
       expect(sessions.size).toBe(1);
       expect(sessions.get(data.session_id)!.subject).toBe("sejarah");
       expect(sessions.get(data.session_id)!.status).toBe("awaiting-answer");
 
       expect(createSession).toHaveBeenCalledOnce();
-      expect(generateMCQ).toHaveBeenCalledOnce();
+      expect(generateQuestion).toHaveBeenCalledOnce();
     });
 
     it("should error when subject is empty", async () => {
@@ -162,10 +173,20 @@ describe("MCP Server", () => {
       sessions.set(testSessionId, {
         sessionId: testSessionId,
         subject: "sejarah",
-        subjectConfig: { language: "Bahasa Malaysia", instructions: "" },
+        subjectConfig: {
+          language: "Bahasa Malaysia",
+          instructions: "",
+          mode: "mcq",
+          teachers: {
+            feynman: { displayName: "Feynman", prompt: "teacher_feynman_active.txt" },
+            strict: { displayName: "Strict", prompt: "teacher_strict_active.txt" },
+          },
+          passiveFeedback: ["recap", "propernouns"],
+          prompts: { generate: "generate_quiz.txt" },
+        },
         topic: mockTopicSummary,
         topicData: mockTopicWithQuestions,
-        mcq: mockMCQ,
+        question: mockMCQ,
         studentAnswer: "",
         correct: false,
         activeTeacher: "feynman",
@@ -203,10 +224,20 @@ describe("MCP Server", () => {
       sessions.set("completed-session", {
         sessionId: "completed-session",
         subject: "sejarah",
-        subjectConfig: { language: "Bahasa Malaysia", instructions: "" },
+        subjectConfig: {
+          language: "Bahasa Malaysia",
+          instructions: "",
+          mode: "mcq",
+          teachers: {
+            feynman: { displayName: "Feynman", prompt: "teacher_feynman_active.txt" },
+            strict: { displayName: "Strict", prompt: "teacher_strict_active.txt" },
+          },
+          passiveFeedback: ["recap", "propernouns"],
+          prompts: { generate: "generate_quiz.txt" },
+        },
         topic: mockTopicSummary,
         topicData: mockTopicWithQuestions,
-        mcq: mockMCQ,
+        question: mockMCQ,
         studentAnswer: "A",
         correct: false,
         activeTeacher: "strict",
@@ -217,6 +248,7 @@ describe("MCP Server", () => {
       (getSessionDetail as Mock).mockReturnValue({
         session: { summary: '{"total":1,"answered":1,"correct":1}' },
         questions: [{
+          mcq: JSON.stringify(mockMCQ),
           dialogue: JSON.stringify([
             { role: "system", content: "prompt" },
             { role: "user", content: "initial" },
@@ -236,14 +268,14 @@ describe("MCP Server", () => {
 
       expect(isError).toBeFalsy();
       expect(data.completed).toBe(true);
-      expect(data.response).toBe("Final response from tutor.");
+      expect(data.response).toBe("recap feedback");
       expect(data.teacher).toBe("feynman");
       expect(data.feedback).toBeDefined();
       expect(data.summary).toBeDefined();
     });
 
     it("should start Feynman dialogue on correct answer", async () => {
-      (buildFeynmanPrompt as Mock).mockReturnValue("feynman system prompt");
+      (buildTeacherPrompt as Mock).mockReturnValue("feynman system prompt");
       (callLLMStructured as Mock).mockResolvedValue({
         message: "Great! Tell me about Kemerdekaan.",
       });
@@ -256,8 +288,7 @@ describe("MCP Server", () => {
       expect(data.response).toBe("Great! Tell me about Kemerdekaan.");
       expect(data.teacher).toBe("feynman");
 
-      expect(buildFeynmanPrompt).toHaveBeenCalledOnce();
-      expect(buildStrictPrompt).not.toHaveBeenCalled();
+      expect(buildTeacherPrompt).toHaveBeenCalledWith("feynman", expect.anything());
 
       const state = sessions.get(testSessionId)!;
       expect(state.status).toBe("in-dialogue");
@@ -266,7 +297,7 @@ describe("MCP Server", () => {
     });
 
     it("should start Strict dialogue on wrong answer", async () => {
-      (buildStrictPrompt as Mock).mockReturnValue("strict system prompt");
+      (buildTeacherPrompt as Mock).mockReturnValue("strict system prompt");
       (callLLMStructured as Mock).mockResolvedValue({
         message: "The correct answer is B.",
       });
@@ -279,8 +310,7 @@ describe("MCP Server", () => {
       expect(data.response).toBe("The correct answer is B.");
       expect(data.teacher).toBe("strict");
 
-      expect(buildStrictPrompt).toHaveBeenCalledOnce();
-      expect(buildFeynmanPrompt).not.toHaveBeenCalled();
+      expect(buildTeacherPrompt).toHaveBeenCalledWith("strict", expect.anything());
 
       const state = sessions.get(testSessionId)!;
       expect(state.status).toBe("in-dialogue");
@@ -288,7 +318,7 @@ describe("MCP Server", () => {
     });
 
     it("should complete session after first student dialogue reply", async () => {
-      (buildFeynmanPrompt as Mock).mockReturnValue("feynman system prompt");
+      (buildTeacherPrompt as Mock).mockReturnValue("feynman system prompt");
       (callLLMStructured as Mock).mockResolvedValueOnce({
         message: "Tell me more!",
       });
@@ -315,9 +345,10 @@ describe("MCP Server", () => {
       expect(data.completed).toBe(true);
       expect(data.feedback).toBeDefined();
       expect(data.summary).toBeDefined();
+      expect(data.mode).toBe("mcq");
       expect(data.feedback.propernouns).toContain("Tunku Abdul Rahman");
       expect(data.response).toContain("─── Feedback Summary ───");
-      expect(data.response).toContain("[Strict Summary]");
+      expect(data.response).toContain("[Feynman Summary]");
       expect(data.response).toContain("[Kata Nama Khas]");
       expect(data.response).toContain("[Recap]");
 
@@ -331,7 +362,7 @@ describe("MCP Server", () => {
     });
 
     it("should omit Kata Nama Khas section when no proper nouns extracted", async () => {
-      (buildFeynmanPrompt as Mock).mockReturnValue("feynman system prompt");
+      (buildTeacherPrompt as Mock).mockReturnValue("feynman system prompt");
       (callLLMStructured as Mock).mockResolvedValueOnce({
         message: "Tell me more!",
       });
@@ -354,7 +385,7 @@ describe("MCP Server", () => {
       expect(data.completed).toBe(true);
       expect(data.feedback.propernouns).toBe("");
       expect(data.response).toContain("─── Feedback Summary ───");
-      expect(data.response).toContain("[Strict Summary]");
+      expect(data.response).toContain("[Feynman Summary]");
       expect(data.response).toContain("[Recap]");
       expect(data.response).not.toContain("[Kata Nama Khas]");
     });

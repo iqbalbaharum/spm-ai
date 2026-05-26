@@ -1,9 +1,23 @@
+export type QuizMode = "mcq" | "subjective";
+
 export interface MCQ {
   question: string;
   options: [string, string, string, string];
   correctAnswer: "A" | "B" | "C" | "D";
   explanation: string;
   keyword: string;
+}
+
+export interface SubjectiveQuestion {
+  question: string;
+  markingScheme: string;
+  keyword: string;
+}
+
+export type QuizQuestion = MCQ | SubjectiveQuestion;
+
+export function isMcq(q: QuizQuestion): q is MCQ {
+  return "options" in q;
 }
 
 export interface ChatMessage {
@@ -27,13 +41,22 @@ export interface GeneratorInput {
   topicText: string;
   examQuestions: string[];
   subjectInstructions: string;
+  mode: QuizMode;
   sessionId?: string;
 }
 
+export interface EvalResult {
+  feynmanEligible: boolean;
+  score?: number;
+  maxScore?: number;
+  feedback: string;
+}
+
 export interface DialogueContext {
-  mcq: MCQ;
+  question: QuizQuestion;
   studentAnswer: string;
   correct: boolean;
+  evalResult?: EvalResult;
   topic: string;
   topicText: string;
   examQuestions: string[];
@@ -52,9 +75,10 @@ export interface PassiveFeedback {
 export interface QuestionRecord {
   seq: number;
   topic: string;
-  mcq: MCQ;
+  question: QuizQuestion;
   studentAnswer: string | null;
   correct: boolean | null;
+  evalResult?: EvalResult | null;
   activeTeacher: "strict" | "feynman" | null;
   dialogue: ChatMessage[];
   feedback: PassiveFeedback;
@@ -78,9 +102,20 @@ export interface TopicSummary {
   questionCount: number;
 }
 
+export interface TeacherConfig {
+  displayName: string;
+  prompt: string;
+}
+
 export interface SubjectConfig {
   language: string;
   instructions: string;
+  mode: QuizMode;
+  teachers: Record<string, TeacherConfig>;
+  passiveFeedback: string[];
+  prompts: {
+    generate: string;
+  };
 }
 
 export interface TopicWithQuestions {

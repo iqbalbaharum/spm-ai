@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import http from "node:http";
+import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -10,10 +11,10 @@ import {
   ErrorCode,
   McpError,
 } from "@modelcontextprotocol/sdk/types.js";
-import { generateMCQ } from "./agents/generator.js";
+import { generateQuestion } from "./agents/generator.js";
 import {
-  buildFeynmanPrompt,
-  buildStrictPrompt,
+  buildTeacherPrompt,
+  evaluateSubjective,
   passiveFeedback,
   passiveSummaries,
   extractProperNouns,
@@ -30,7 +31,7 @@ import {
 import { config } from "./config.js";
 import type {
   ChatMessage,
-  MCQ,
+  QuizQuestion,
   DialogueContext,
   PassiveFeedback,
   QuestionRecord,
@@ -38,6 +39,7 @@ import type {
   TopicSummary,
   TopicWithQuestions,
 } from "./types.js";
+import { isMcq } from "./types.js";
 
 const SERVER_NAME = "spm-ai-mcp";
 const SERVER_VERSION = "0.1.0";
@@ -65,9 +67,10 @@ interface SessionState {
   subjectConfig: SubjectConfig;
   topic: TopicSummary;
   topicData: TopicWithQuestions;
-  mcq: MCQ;
+  question: QuizQuestion;
   studentAnswer: string;
   correct: boolean;
+  evalResult?: { feynmanEligible: boolean; score?: number; maxScore?: number; feedback: string };
   activeTeacher: "feynman" | "strict";
   status: "awaiting-answer" | "in-dialogue" | "complete";
   messages: ChatMessage[];
@@ -78,9 +81,10 @@ const sessions = new Map<string, SessionState>();
 
 function buildDialogueContext(state: SessionState): DialogueContext {
   return {
-    mcq: state.mcq,
+    question: state.question,
     studentAnswer: state.studentAnswer,
     correct: state.correct,
+    evalResult: state.evalResult,
     topic: state.topic.name,
     topicText: state.topicData.text,
     examQuestions: state.topicData.examQuestions,
@@ -96,35 +100,31 @@ async function completeSessionAndGetResult(
 ): Promise<Record<string, unknown>> {
   const ctx = buildDialogueContext(state);
   const activeTeacher = state.activeTeacher;
-
-  let recap = "";
-  try {
-    recap = await passiveFeedback("recap", ctx);
-  } catch {
-    recap = "(feedback unavailable)";
-  }
+  const subjectConfig = state.subjectConfig;
 
   let summaries = { strict: "", feynman: "" };
   try {
     summaries = await passiveSummaries(activeTeacher, ctx);
   } catch {
-    summaries = {
-      strict:
-        activeTeacher === "feynman"
-          ? ctx.mcq.explanation
-          : "(feedback unavailable)",
-      feynman:
-        activeTeacher === "strict"
-          ? `The key concept is "${ctx.mcq.keyword}". ${ctx.mcq.explanation}`
-          : "(feedback unavailable)",
-    };
+    // fallback handled below
+  }
+
+  let recap = "";
+  if (subjectConfig.passiveFeedback.includes("recap")) {
+    try {
+      recap = await passiveFeedback("recap", ctx);
+    } catch {
+      recap = "(feedback unavailable)";
+    }
   }
 
   let propernouns = "";
-  try {
-    propernouns = await extractProperNouns(ctx);
-  } catch {
-    propernouns = "";
+  if (subjectConfig.passiveFeedback.includes("propernouns")) {
+    try {
+      propernouns = await extractProperNouns(ctx);
+    } catch {
+      propernouns = "";
+    }
   }
 
   const feedback: PassiveFeedback = {
@@ -138,24 +138,27 @@ async function completeSessionAndGetResult(
   const finalParts = [
     `─── Feedback Summary ───`,
     ``,
-    `  [Strict Summary]`,
-    `  ${summaries.strict}`,
+    `  [${subjectConfig.teachers[activeTeacher]?.displayName || activeTeacher} Summary]`,
+    `  ${generateInlineSummary(activeTeacher, ctx)}`,
   ];
+
+  if (recap) {
+    finalParts.push(``, `  [Recap]`, `  ${recap}`);
+  }
 
   if (propernouns) {
     finalParts.push(``, `  [Kata Nama Khas]`, `  ${propernouns}`);
   }
-
-  finalParts.push(``, `  [Recap]`, `  ${recap}`);
 
   const finalResponse = finalParts.join("\n");
 
   const record: QuestionRecord = {
     seq: 1,
     topic: state.topic.name,
-    mcq: state.mcq,
+    question: state.question,
     studentAnswer: state.studentAnswer,
     correct: state.correct,
+    evalResult: state.evalResult,
     activeTeacher,
     dialogue: state.messages,
     feedback,
@@ -176,9 +179,26 @@ async function completeSessionAndGetResult(
     completed: true,
     response: finalResponse,
     teacher: activeTeacher,
+    mode: subjectConfig.mode,
     feedback,
     summary,
   };
+}
+
+function generateInlineSummary(teacher: string, ctx: DialogueContext): string {
+  if (isMcq(ctx.question)) {
+    if (teacher === "feynman") {
+      return `You answered correctly. The key concept is "${ctx.question.keyword}". ${ctx.question.explanation}`;
+    }
+    return `The correct answer is ${ctx.question.correctAnswer}: ${ctx.question.explanation}`;
+  }
+  if (ctx.evalResult) {
+    if (teacher === "feynman") {
+      return `Good work! You scored ${ctx.evalResult.score}/${ctx.evalResult.maxScore}. ${ctx.evalResult.feedback}`;
+    }
+    return `Mark: ${ctx.evalResult.score}/${ctx.evalResult.maxScore}. ${ctx.evalResult.feedback}`;
+  }
+  return "Session completed.";
 }
 
 function asToolResponse(data: Record<string, unknown>) {
@@ -201,22 +221,23 @@ function reconstructCompletedResponse(sessionId: string): Record<string, unknown
   if (!detail || !detail.questions[0]) return null;
 
   const q = detail.questions[0];
-  const dialogue = typeof q.dialogue === "string" ? JSON.parse(q.dialogue) : q.dialogue;
-  const lastAssistantMsg = [...(dialogue as ChatMessage[])]
-    .reverse()
-    .find((m) => m.role === "assistant");
+  const question = typeof q.mcq === "string" ? JSON.parse(q.mcq) : q.mcq;
+  const mode = question && "options" in question ? "mcq" : "subjective";
+
+  const feedback: PassiveFeedback = {
+    strict: q.feedback_strict as string || "",
+    feynman: q.feedback_feynman as string || "",
+    recap: q.feedback_recap as string || "",
+    kbat: q.feedback_kbat as string || "",
+    propernouns: q.feedback_propernouns as string || "",
+  };
 
   return {
     completed: true,
-    response: lastAssistantMsg?.content || "",
+    response: feedback.recap || "(completed)",
     teacher: q.active_teacher,
-    feedback: {
-      strict: q.feedback_strict,
-      feynman: q.feedback_feynman,
-      recap: q.feedback_recap,
-      kbat: q.feedback_kbat,
-      propernouns: q.feedback_propernouns,
-    },
+    mode,
+    feedback,
     summary: typeof detail.session.summary === "string"
       ? JSON.parse(detail.session.summary)
       : detail.session.summary,
@@ -231,13 +252,13 @@ export async function handleListTools() {
       {
         name: "get_question",
         description:
-          "Get a quiz question for a given SPM subject. Returns the question, options, keyword, and a session_id for subsequent answer_loop calls.",
+          "Get a quiz question for a given SPM subject. Returns the question, options (if MCQ), marking_scheme (if subjective), keyword, topic, and a session_id for subsequent answer_loop calls.",
         inputSchema: {
           type: "object",
           properties: {
             subject: {
               type: "string",
-              description: "Subject name (e.g. sejarah)",
+              description: "Subject name (e.g. sejarah, bahasa-melayu)",
             },
           },
           required: ["subject"],
@@ -246,7 +267,7 @@ export async function handleListTools() {
       {
         name: "answer_loop",
         description:
-          "Submit an answer or continue the dialogue for an active session. First call provides the MCQ answer (A/B/C/D). Subsequent calls provide the student's dialogue response. Returns { completed, response, ... } — when completed is true, the session is finished and feedback is included.",
+          "Submit an answer or continue the dialogue for an active session. First call provides the MCQ answer (A/B/C/D) or essay text. Subsequent calls provide the student's dialogue response. Returns { completed, response, ... } — when completed is true, the session is finished and feedback is included.",
         inputSchema: {
           type: "object",
           properties: {
@@ -257,7 +278,7 @@ export async function handleListTools() {
             answer: {
               type: "string",
               description:
-                "MCQ answer (A/B/C/D) on first call, or dialogue text on subsequent calls",
+                "MCQ answer (A/B/C/D) or essay text on first call, or dialogue text on subsequent calls",
             },
           },
           required: ["session_id", "answer"],
@@ -273,6 +294,17 @@ export async function handleGetQuestion(args: Record<string, unknown>) {
     return asErrorResponse("subject is required");
   }
 
+  const subjectConfig: SubjectConfig =
+    config.subjectConfigs[subject] ||
+    config.subjectConfigs["sejarah"] || {
+      language: "Bahasa Malaysia",
+      instructions: "",
+      mode: "mcq",
+      teachers: {},
+      passiveFeedback: [],
+      prompts: { generate: "generate_quiz.txt" },
+    };
+
   const topics = await getParetoTopics(subject);
   if (topics.length === 0) {
     return asErrorResponse(
@@ -283,35 +315,26 @@ export async function handleGetQuestion(args: Record<string, unknown>) {
   const selectedTopic = shuffle(topics)[0];
   const topicData = await getTopicWithQuestions(selectedTopic.name);
 
-  const activeSubject: string = (
-    selectedTopic.subject || subject
-  ).toLowerCase();
-  const subjectConfig: SubjectConfig =
-    config.subjectConfigs[activeSubject] ||
-    config.subjectConfigs["sejarah"] || {
-      language: "Bahasa Malaysia",
-      instructions: "",
-    };
-
   const sid = sessionId();
 
-  const mcq = await generateMCQ({
+  const question = await generateQuestion({
     topicName: selectedTopic.name,
     topicText: topicData.text,
     examQuestions: topicData.examQuestions,
     subjectInstructions: subjectConfig.instructions,
+    mode: subjectConfig.mode,
     sessionId: sid,
   });
 
-  createSession(sid, activeSubject);
+  createSession(sid, subject);
 
   const state: SessionState = {
     sessionId: sid,
-    subject: activeSubject,
+    subject,
     subjectConfig,
     topic: selectedTopic,
     topicData,
-    mcq,
+    question,
     studentAnswer: "",
     correct: false,
     activeTeacher: "feynman",
@@ -322,52 +345,73 @@ export async function handleGetQuestion(args: Record<string, unknown>) {
   sessions.set(sid, state);
   saveSessionState(sid, state);
 
+  if (isMcq(question)) {
+    return asToolResponse({
+      session_id: sid,
+      question: question.question,
+      options: question.options,
+      keyword: question.keyword,
+      topic: selectedTopic.name,
+      mode: "mcq",
+    });
+  }
+
   return asToolResponse({
     session_id: sid,
-    question: mcq.question,
-    options: mcq.options,
-    keyword: mcq.keyword,
+    question: question.question,
+    marking_scheme: question.markingScheme,
+    keyword: question.keyword,
     topic: selectedTopic.name,
+    mode: "subjective",
   });
 }
 
 export async function handleAnswerLoop(args: Record<string, unknown>) {
-  const sessionId = args?.session_id as string;
+  const sessionIdArg = args?.session_id as string;
   const answer = args?.answer as string;
 
-  if (!sessionId) return asErrorResponse("session_id is required");
+  if (!sessionIdArg) return asErrorResponse("session_id is required");
   if (!answer) return asErrorResponse("answer is required");
 
-  const state = sessions.get(sessionId);
+  const state = sessions.get(sessionIdArg);
   if (!state) {
     return asErrorResponse(
-      `Session "${sessionId}" not found. It may have expired or already completed.`
+      `Session "${sessionIdArg}" not found. It may have expired or already completed.`
     );
   }
   if (state.status === "complete") {
-    const result = reconstructCompletedResponse(sessionId);
+    const result = reconstructCompletedResponse(sessionIdArg);
     if (result) return asToolResponse(result);
     return asErrorResponse(
-      `Session "${sessionId}" is already complete.`
+      `Session "${sessionIdArg}" is already complete.`
     );
   }
+
   if (state.status === "awaiting-answer") {
-    const correct = answer.toUpperCase() === state.mcq.correctAnswer;
     state.studentAnswer = answer;
-    state.correct = correct;
-    state.activeTeacher = correct ? "feynman" : "strict";
+
+    if (isMcq(state.question)) {
+      const correct = answer.toUpperCase() === state.question.correctAnswer;
+      state.correct = correct;
+      state.activeTeacher = correct ? "feynman" : "strict";
+    } else {
+      const ctx = buildDialogueContext(state);
+      const evalResult = await evaluateSubjective(ctx);
+      state.evalResult = evalResult;
+      state.correct = evalResult.feynmanEligible;
+      state.activeTeacher = evalResult.feynmanEligible ? "feynman" : "strict";
+    }
 
     const ctx = buildDialogueContext(state);
+    const systemPrompt = buildTeacherPrompt(state.activeTeacher, ctx);
 
-    const systemPrompt =
-      state.activeTeacher === "feynman"
-        ? buildFeynmanPrompt(ctx)
-        : buildStrictPrompt(ctx);
-
-    const initialUserContent =
-      state.activeTeacher === "feynman"
-        ? `The student answered correctly. Engage them on the keyword "${state.mcq.keyword}".`
-        : `The student answered "${answer}" (wrong). The correct answer is "${state.mcq.correctAnswer}". Engage them.`;
+    const initialUserContent = isMcq(state.question)
+      ? state.activeTeacher === "feynman"
+        ? `The student answered correctly. Engage them on the keyword "${state.question.keyword}".`
+        : `The student answered "${answer}" (wrong). The correct answer is "${state.question.correctAnswer}". Engage them.`
+      : state.activeTeacher === "feynman"
+        ? `The student did well (${state.evalResult?.score}/${state.evalResult?.maxScore}). Engage them.`
+        : `The student needs improvement (${state.evalResult?.score}/${state.evalResult?.maxScore}). Engage them.`;
 
     state.messages = [
       { role: "system", content: systemPrompt },
@@ -391,6 +435,9 @@ export async function handleAnswerLoop(args: Record<string, unknown>) {
       completed: false,
       response: teacherMsg.message,
       teacher: state.activeTeacher,
+      eval: state.evalResult
+        ? { score: state.evalResult.score, maxScore: state.evalResult.maxScore }
+        : undefined,
     });
   }
 
@@ -471,8 +518,8 @@ async function main() {
         return;
       }
 
-      const sessionId = req.headers["mcp-session-id"] as string | undefined;
-      let transport = sessionId ? transports.get(sessionId) : undefined;
+      const sessionIdHeader = req.headers["mcp-session-id"] as string | undefined;
+      let transport = sessionIdHeader ? transports.get(sessionIdHeader) : undefined;
 
       if (!transport) {
         let newSessionId: string | undefined;
@@ -501,7 +548,7 @@ async function main() {
       }
 
       if (config.mcpLogRequests) {
-        const tag = sessionId ? sessionId.slice(0, 8) : "new";
+        const tag = sessionIdHeader ? sessionIdHeader.slice(0, 8) : "new";
         console.error(`  ⇄  ${req.method} /mcp [${tag}] ${rpcMethod ?? "—"}`);
       }
 

@@ -1,6 +1,6 @@
 import chalk from "chalk";
-import { generateMCQ } from "./generator.js";
-import { activeDialogue, passiveFeedback, passiveSummaries, extractProperNouns } from "./teachers.js";
+import { generateQuestion } from "./generator.js";
+import { activeDialogue, evaluateSubjective, passiveFeedback, passiveSummaries, extractProperNouns } from "./teachers.js";
 import { getParetoTopics, getTopicWithQuestions } from "../db/neo4j.js";
 import { createSession, saveQuestionLog, completeSession } from "../db/sqlite.js";
 import { config } from "../config.js";
@@ -11,7 +11,9 @@ import type {
   PassiveFeedback,
   DialogueContext,
   SubjectConfig,
+  QuizQuestion,
 } from "../types.js";
+import { isMcq } from "../types.js";
 
 function shuffle<T>(arr: T[]): T[] {
   const a = [...arr];
@@ -44,7 +46,14 @@ export async function runQuiz(
 
   const selected = shuffle(topics).slice(0, count);
   const activeSubject: string = (selected[0]?.subject || subject || "sejarah").toLowerCase();
-  const subjectConfig: SubjectConfig = config.subjectConfigs[activeSubject] || config.subjectConfigs["sejarah"] || { language: "Bahasa Malaysia", instructions: "" };
+  const subjectConfig: SubjectConfig = config.subjectConfigs[activeSubject] || config.subjectConfigs["sejarah"] || {
+    language: "Bahasa Malaysia",
+    instructions: "",
+    mode: "mcq",
+    teachers: {},
+    passiveFeedback: [],
+    prompts: { generate: "generate_quiz.txt" },
+  };
   const sid = sessionId();
   createSession(sid, activeSubject);
 
@@ -63,23 +72,25 @@ export async function runQuiz(
 
     const topicData = await getTopicWithQuestions(topic.name);
     logEvent(sid, "ctx", { type: "topic", topicName: topicData.name, topicText: topicData.text, examQuestions: topicData.examQuestions });
-    const mcq = await generateMCQ({
+
+    const question = await generateQuestion({
       topicName: topic.name,
       topicText: topicData.text,
       examQuestions: topicData.examQuestions,
       subjectInstructions: subjectConfig.instructions,
+      mode: subjectConfig.mode,
       sessionId: sid,
     });
 
-    displayMCQ(mcq);
+    displayQuestion(question, subjectConfig.mode);
 
-    const answer = (await getUserInput()).trim().toUpperCase();
+    const answer = (await getUserInput()).trim();
 
     if (answer === "/skip") {
       records.push({
         seq: i + 1,
         topic: topic.name,
-        mcq,
+        question,
         studentAnswer: null,
         correct: null,
         activeTeacher: null,
@@ -90,50 +101,73 @@ export async function runQuiz(
       continue;
     }
 
-    const correct = answer === mcq.correctAnswer;
-    const ctx: DialogueContext = { mcq, studentAnswer: answer, correct, topic: topic.name, topicText: topicData.text, examQuestions: topicData.examQuestions, subjectInstructions: subjectConfig.instructions, sessionId: sid };
+    let correct: boolean;
+    let evalResult: DialogueContext["evalResult"] | undefined;
+
+    if (isMcq(question)) {
+      correct = answer.toUpperCase() === question.correctAnswer;
+    } else {
+      const ctx: DialogueContext = {
+        question,
+        studentAnswer: answer,
+        correct: false,
+        topic: topic.name,
+        topicText: topicData.text,
+        examQuestions: topicData.examQuestions,
+        subjectInstructions: subjectConfig.instructions,
+        sessionId: sid,
+      };
+      evalResult = await evaluateSubjective(ctx);
+      correct = evalResult.feynmanEligible;
+    }
+
+    const ctx: DialogueContext = {
+      question,
+      studentAnswer: answer,
+      correct,
+      evalResult,
+      topic: topic.name,
+      topicText: topicData.text,
+      examQuestions: topicData.examQuestions,
+      subjectInstructions: subjectConfig.instructions,
+      sessionId: sid,
+    };
 
     if (correct) {
-      console.log(chalk.green(`  ✓ Correct!\n`));
+      console.log(chalk.green(`  ✓ Good!\n`));
     } else {
-      console.log(
-        chalk.red(
-          `  ✗ Wrong. Correct answer: ${mcq.correctAnswer}\n`
-        )
-      );
+      console.log(chalk.red(`  ✗ Needs improvement.\n`));
     }
 
     const activeTeacher = correct ? "feynman" : "strict";
     const dialogue = await activeDialogue(activeTeacher, ctx, getUserInput);
 
-    console.log(chalk.dim("\n  ─── Feedback Summary ───\n"));
+    console.log(chalk.dim("\n  ─── Feedback ───\n"));
 
-    const [passive, summaries, propernouns] = await Promise.all([
-      Promise.all([
-        passiveFeedback("recap", ctx),
-        passiveFeedback("kbat", ctx),
-      ]),
-      passiveSummaries(activeTeacher, ctx),
-      extractProperNouns(ctx).catch(() => "(feedback unavailable)"),
-    ]);
-
-    const [recap, kbat] = passive;
     const feedback: PassiveFeedback = {
-      strict: summaries.strict,
-      feynman: summaries.feynman,
-      recap,
-      kbat,
-      propernouns,
+      strict: "",
+      feynman: "",
+      recap: "",
+      kbat: "",
+      propernouns: "",
     };
 
-    displayFeedback(activeTeacher, feedback);
+    if (subjectConfig.passiveFeedback.includes("recap")) {
+      feedback.recap = await passiveFeedback("recap", ctx).catch(() => "");
+    }
+    if (subjectConfig.passiveFeedback.includes("propernouns")) {
+      feedback.propernouns = await extractProperNouns(ctx).catch(() => "");
+    }
+
+    displayFeedback(activeTeacher, feedback, subjectConfig);
 
     records.push({
       seq: i + 1,
       topic: topic.name,
-      mcq,
+      question,
       studentAnswer: answer,
       correct,
+      evalResult,
       activeTeacher,
       dialogue,
       feedback,
@@ -158,37 +192,37 @@ export async function runQuiz(
   console.log(chalk.green(`  Score: ${correctCount}/${records.length} (${Math.round((correctCount / records.length) * 100)}%)\n`));
 }
 
-function displayMCQ(mcq: {
-  question: string;
-  options: [string, string, string, string];
-}): void {
-  console.log(`  ${mcq.question}\n`);
-  for (const opt of mcq.options) {
-    console.log(`    ${opt}`);
+function displayQuestion(question: QuizQuestion, mode: string): void {
+  console.log(`  ${question.question}\n`);
+  if (isMcq(question)) {
+    for (const opt of question.options) {
+      console.log(`    ${opt}`);
+    }
+    console.log();
+    process.stdout.write(chalk.cyan("  Your answer (A/B/C/D) or /skip: "));
+  } else {
+    console.log(chalk.dim(`  Marking Scheme: ${question.markingScheme}\n`));
+    process.stdout.write(chalk.cyan("  Your answer (text) or /skip: "));
   }
-  console.log();
-  process.stdout.write(chalk.cyan("  Your answer (A/B/C/D) or /skip: "));
 }
 
 function displayFeedback(
   activeTeacher: string,
-  feedback: PassiveFeedback
+  feedback: PassiveFeedback,
+  subjectConfig: SubjectConfig
 ): void {
-  const activeLabel = activeTeacher === "feynman" ? "Feynman" : "Strict";
-  const passiveSummary =
-    activeTeacher === "feynman" ? feedback.strict : feedback.feynman;
+  const teacherCfg = subjectConfig.teachers[activeTeacher];
+  const label = teacherCfg?.displayName || activeTeacher;
+  console.log(chalk.dim(`  [${label} Summary]`));
+  console.log(`  ${(activeTeacher === "feynman" ? feedback.feynman : feedback.strict) || "(completed)"}\n`);
 
-  console.log(chalk.dim(`  [${activeLabel} Summary]`));
-  console.log(`  ${passiveSummary}\n`);
-
-  console.log(chalk.dim(`  [Recap]`));
-  console.log(`  ${feedback.recap}\n`);
+  if (feedback.recap) {
+    console.log(chalk.dim(`  [Recap]`));
+    console.log(`  ${feedback.recap}\n`);
+  }
 
   if (feedback.propernouns) {
     console.log(chalk.dim(`  [Kata Nama Khas]`));
     console.log(`  ${feedback.propernouns}\n`);
   }
-
-  console.log(chalk.dim(`  [KBAT]`));
-  console.log(`  ${feedback.kbat}\n`);
 }

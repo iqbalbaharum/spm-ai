@@ -2,19 +2,26 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { callLLMStructured, logEvent } from "./llm.js";
-import type { ChatMessage, GeneratorInput, MCQ } from "../types.js";
+import type { ChatMessage, GeneratorInput, MCQ, SubjectiveQuestion, QuizQuestion } from "../types.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const promptTemplate = readFileSync(
-  join(__dirname, "../../prompts/generate_quiz.txt"),
-  "utf-8"
-);
+const promptDir = join(__dirname, "../../prompts");
+
+function loadPrompt(name: string): string {
+  return readFileSync(join(promptDir, name), "utf-8");
+}
 
 interface RawMCQ {
   question: string;
   options: string[];
   correctAnswer: string;
   explanation: string;
+  keyword?: string;
+}
+
+interface RawSubjective {
+  question: string;
+  markingScheme: string;
   keyword?: string;
 }
 
@@ -50,7 +57,16 @@ If invalid, return the corrected version:
 
 Valid JSON only. No markdown fences.`;
 
-export async function generateMCQ(input: GeneratorInput): Promise<MCQ> {
+export async function generateQuestion(input: GeneratorInput): Promise<QuizQuestion> {
+  if (input.mode === "mcq") {
+    return generateMCQ(input);
+  }
+  return generateSubjective(input);
+}
+
+async function generateMCQ(input: GeneratorInput): Promise<MCQ> {
+  const promptTemplate = loadPrompt("generate_quiz.txt");
+
   const systemPrompt = promptTemplate
     .replace("{subjectInstructions}", input.subjectInstructions)
     .replace("{topicName}", input.topicName)
@@ -69,7 +85,7 @@ export async function generateMCQ(input: GeneratorInput): Promise<MCQ> {
   let raw: RawMCQ;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const messages = attempt === 1
+    const messages: ChatMessage[] = attempt === 1
       ? baseMessages
       : [
           ...baseMessages,
@@ -101,7 +117,8 @@ export async function generateMCQ(input: GeneratorInput): Promise<MCQ> {
       { sessionId: input.sessionId }
     );
 
-    logEvent(input.sessionId, "eval", {
+    logEvent(input.sessionId, "ctx", {
+      eventType: "eval",
       attempt,
       topic: input.topicName,
       question: raw.question,
@@ -119,7 +136,6 @@ export async function generateMCQ(input: GeneratorInput): Promise<MCQ> {
     if (attempt === maxAttempts) {
       throw new Error(`Failed to generate valid MCQ after ${maxAttempts} attempts`);
     }
-
   }
 
   const rawOut = raw!;
@@ -140,6 +156,34 @@ export async function generateMCQ(input: GeneratorInput): Promise<MCQ> {
     correctAnswer: rawOut.correctAnswer as "A" | "B" | "C" | "D",
     explanation: rawOut.explanation,
     keyword,
+  };
+}
+
+async function generateSubjective(input: GeneratorInput): Promise<SubjectiveQuestion> {
+  const promptTemplate = loadPrompt("generate_bm_soalan.txt");
+
+  const systemPrompt = promptTemplate
+    .replace("{subjectInstructions}", input.subjectInstructions)
+    .replace("{topicName}", input.topicName)
+    .replace("{topicText}", input.topicText)
+    .replace(
+      "{examQuestions}",
+      input.examQuestions.map((q) => `- ${q}`).join("\n") || "(none available)"
+    );
+
+  const messages: ChatMessage[] = [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: "Generate 1 subjective question in JSON format." },
+  ];
+
+  const raw = await callLLMStructured<RawSubjective>(messages, {
+    sessionId: input.sessionId,
+  });
+
+  return {
+    question: raw.question,
+    markingScheme: raw.markingScheme,
+    keyword: raw.keyword?.trim() || extractKeyword(input.topicText),
   };
 }
 
