@@ -1,6 +1,6 @@
 import OpenAI from "openai";
 import { config } from "../config.js";
-import type { ChatMessage, LLMResponse, LLMOptions, TeacherResponse } from "../types.js";
+import type { ChatMessage, LLMOptions } from "../types.js";
 
 const client = new OpenAI({
   baseURL: config.openrouterBaseUrl,
@@ -22,6 +22,11 @@ function truncateDeep(val: unknown, maxLen: number): unknown {
     return obj;
   }
   return val;
+}
+
+interface LLMResponse {
+  content: string;
+  dialogueComplete?: boolean;
 }
 
 export function logEvent(
@@ -125,13 +130,4 @@ export async function callLLMStructured<T>(
   throw new Error("callLLMStructured exhausted retries");
 }
 
-export function asTeacherResponse(raw: unknown): TeacherResponse {
-  if (raw && typeof raw === "object") {
-    const msg = (raw as Record<string, unknown>).message;
-    const cleaned = typeof msg === "string" && msg.length > 0
-      ? msg.replace(/[*_`\[]/g, "")
-      : "Terima kasih. Sila teruskan pembelajaran.";
-    return { message: cleaned };
-  }
-  return { message: "Terima kasih. Sesi diteruskan." };
-}
+

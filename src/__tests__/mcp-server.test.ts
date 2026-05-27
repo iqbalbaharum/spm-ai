@@ -6,25 +6,15 @@ vi.mock("../agents/generator.js", () => ({
 }));
 
 vi.mock("../agents/teachers.js", () => ({
-  buildTeacherPrompt: vi.fn(),
-  evaluateSubjective: vi.fn(),
+  buildActiveRecallPrompt: vi.fn(),
   passiveFeedback: vi.fn(),
-  passiveSummaries: vi.fn(),
   extractProperNouns: vi.fn(),
+  generateRecapSummary: vi.fn(),
+  evaluateSubjectiveAnswer: vi.fn(),
 }));
 
 vi.mock("../agents/llm.js", () => ({
   callLLMStructured: vi.fn(),
-  asTeacherResponse: vi.fn((raw: unknown) => {
-    if (raw && typeof raw === "object") {
-      const msg = (raw as Record<string, unknown>).message;
-      const cleaned = typeof msg === "string" && msg.length > 0
-        ? msg.replace(/[*_`\[]/g, "")
-        : "Terima kasih. Sila teruskan pembelajaran.";
-      return { message: cleaned };
-    }
-    return { message: "Terima kasih. Sesi diteruskan." };
-  }),
 }));
 
 vi.mock("../db/neo4j.js", () => ({
@@ -36,8 +26,12 @@ vi.mock("../db/neo4j.js", () => ({
 vi.mock("../db/sqlite.js", () => ({
   createSession: vi.fn(),
   saveQuestionLog: vi.fn(),
+  saveActiveRecallMessage: vi.fn(),
+  saveFeedback: vi.fn(),
   completeSession: vi.fn(),
-  saveSessionState: vi.fn(),
+  getUsedQuestions: vi.fn(),
+  getActiveRecall: vi.fn(),
+  getFeedbacks: vi.fn(),
   getSessionDetail: vi.fn(),
 }));
 
@@ -70,10 +64,20 @@ import {
 } from "../mcp-server.js";
 
 import { generateQuestion } from "../agents/generator.js";
-import { buildTeacherPrompt, evaluateSubjective, passiveFeedback, passiveSummaries, extractProperNouns } from "../agents/teachers.js";
+import { buildActiveRecallPrompt, passiveFeedback, extractProperNouns, generateRecapSummary } from "../agents/teachers.js";
 import { callLLMStructured } from "../agents/llm.js";
 import { getParetoTopics, getTopicWithQuestions } from "../db/neo4j.js";
-import { createSession, saveQuestionLog, completeSession, getSessionDetail } from "../db/sqlite.js";
+import {
+  createSession,
+  saveQuestionLog,
+  saveActiveRecallMessage,
+  saveFeedback,
+  completeSession,
+  getUsedQuestions,
+  getActiveRecall,
+  getFeedbacks,
+  getSessionDetail,
+} from "../db/sqlite.js";
 
 const mockTopicSummary = {
   name: "Kemerdekaan Tanah Melayu",
@@ -125,6 +129,7 @@ describe("MCP Server", () => {
     it("should return a question for a valid subject", async () => {
       (getParetoTopics as Mock).mockResolvedValue([mockTopicSummary]);
       (getTopicWithQuestions as Mock).mockResolvedValue(mockTopicWithQuestions);
+      (getUsedQuestions as Mock).mockReturnValue([]);
       (generateQuestion as Mock).mockResolvedValue(mockMCQ);
 
       const result = await handleGetQuestion({ subject: "sejarah" });
@@ -145,6 +150,7 @@ describe("MCP Server", () => {
 
       expect(createSession).toHaveBeenCalledOnce();
       expect(generateQuestion).toHaveBeenCalledOnce();
+      expect(getUsedQuestions).toHaveBeenCalledOnce();
     });
 
     it("should error when subject is empty", async () => {
@@ -188,11 +194,9 @@ describe("MCP Server", () => {
         topicData: mockTopicWithQuestions,
         question: mockMCQ,
         studentAnswer: "",
-        correct: false,
-        activeTeacher: "feynman",
         status: "awaiting-answer",
-        messages: [],
         rounds: 0,
+        systemPrompt: "",
       });
     });
 
@@ -239,28 +243,26 @@ describe("MCP Server", () => {
         topicData: mockTopicWithQuestions,
         question: mockMCQ,
         studentAnswer: "A",
-        correct: false,
-        activeTeacher: "strict",
         status: "complete",
-        messages: [],
         rounds: 0,
+        systemPrompt: "",
       });
       (getSessionDetail as Mock).mockReturnValue({
-        session: { summary: '{"total":1,"answered":1,"correct":1}' },
+        session: { summary: '{"total":1}' },
         questions: [{
-          mcq: JSON.stringify(mockMCQ),
-          dialogue: JSON.stringify([
-            { role: "system", content: "prompt" },
-            { role: "user", content: "initial" },
-            { role: "assistant", content: "Final response from tutor." },
-          ]),
-          active_teacher: "feynman",
-          feedback_strict: "strict summary",
-          feedback_feynman: "feynman summary",
-          feedback_recap: "recap feedback",
-          feedback_kbat: "kbat feedback",
-          feedback_propernouns: "• Tunku Abdul Rahman — Ketua Menteri pertama",
+          question: mockMCQ.question,
+          options: JSON.stringify(mockMCQ.options),
+          correct_answer: mockMCQ.correctAnswer,
         }],
+        activeRecall: [
+          { role: "system", content: "prompt" },
+          { role: "user", content: "initial" },
+          { role: "assistant", content: "Final response" },
+        ],
+        feedbacks: [
+          { instructor: "recap", text: "recap feedback" },
+          { instructor: "propernouns", text: "• Tunku Abdul Rahman — Ketua Menteri pertama" },
+        ],
       });
 
       const result = await handleAnswerLoop({ session_id: "completed-session", answer: "A" });
@@ -269,15 +271,15 @@ describe("MCP Server", () => {
       expect(isError).toBeFalsy();
       expect(data.completed).toBe(true);
       expect(data.response).toBe("recap feedback");
-      expect(data.teacher).toBe("feynman");
-      expect(data.feedback).toBeDefined();
+      expect(data.feedbacks).toBeDefined();
       expect(data.summary).toBeDefined();
     });
 
-    it("should start Feynman dialogue on correct answer", async () => {
-      (buildTeacherPrompt as Mock).mockReturnValue("feynman system prompt");
+    it("should start active recall on first answer", async () => {
+      (buildActiveRecallPrompt as Mock).mockReturnValue("active recall system prompt");
       (callLLMStructured as Mock).mockResolvedValue({
-        message: "Great! Tell me about Kemerdekaan.",
+        message: "Tell me about Kemerdekaan.",
+        complete: false,
       });
 
       const result = await handleAnswerLoop({ session_id: testSessionId, answer: "B" });
@@ -285,108 +287,100 @@ describe("MCP Server", () => {
 
       expect(isError).toBeFalsy();
       expect(data.completed).toBe(false);
-      expect(data.response).toBe("Great! Tell me about Kemerdekaan.");
-      expect(data.teacher).toBe("feynman");
+      expect(data.response).toBe("Tell me about Kemerdekaan.");
+      expect(data.round).toBe(0);
 
-      expect(buildTeacherPrompt).toHaveBeenCalledWith("feynman", expect.anything());
+      expect(buildActiveRecallPrompt).toHaveBeenCalledOnce();
+      expect(saveActiveRecallMessage).toHaveBeenCalledTimes(3); // system, user, assistant
 
       const state = sessions.get(testSessionId)!;
       expect(state.status).toBe("in-dialogue");
-      expect(state.correct).toBe(true);
       expect(state.studentAnswer).toBe("B");
     });
 
-    it("should start Strict dialogue on wrong answer", async () => {
-      (buildTeacherPrompt as Mock).mockReturnValue("strict system prompt");
-      (callLLMStructured as Mock).mockResolvedValue({
-        message: "The correct answer is B.",
-      });
-
-      const result = await handleAnswerLoop({ session_id: testSessionId, answer: "A" });
-      const { isError, data } = parseToolResponse(result);
-
-      expect(isError).toBeFalsy();
-      expect(data.completed).toBe(false);
-      expect(data.response).toBe("The correct answer is B.");
-      expect(data.teacher).toBe("strict");
-
-      expect(buildTeacherPrompt).toHaveBeenCalledWith("strict", expect.anything());
-
-      const state = sessions.get(testSessionId)!;
-      expect(state.status).toBe("in-dialogue");
-      expect(state.correct).toBe(false);
-    });
-
-    it("should complete session after first student dialogue reply", async () => {
-      (buildTeacherPrompt as Mock).mockReturnValue("feynman system prompt");
+    it("should complete session after max active recall rounds", async () => {
+      (buildActiveRecallPrompt as Mock).mockReturnValue("active recall system prompt");
       (callLLMStructured as Mock).mockResolvedValueOnce({
-        message: "Tell me more!",
+        message: "First question?",
+        complete: false,
       });
 
       const first = await handleAnswerLoop({ session_id: testSessionId, answer: "B" });
       const { data: firstData } = parseToolResponse(first);
       expect(firstData.completed).toBe(false);
-      expect(firstData.response).toBe("Tell me more!");
-      expect(firstData.teacher).toBe("feynman");
+      expect(firstData.response).toBe("First question?");
 
-      (passiveFeedback as Mock).mockResolvedValue("feedback content");
-      (passiveSummaries as Mock).mockResolvedValue({ strict: "s", feynman: "f" });
+      // Set state to in-dialogue with 2 rounds already done
+      const state = sessions.get(testSessionId)!;
+      state.status = "in-dialogue";
+      state.rounds = 2;
+
+      (passiveFeedback as Mock).mockResolvedValue("recap content");
       (extractProperNouns as Mock).mockResolvedValue(
-        "• Tunku Abdul Rahman — Ketua Menteri pertama\n• V.T. Sambanthan — Menteri Buruh"
+        "• Tunku Abdul Rahman — Ketua Menteri pertama"
+      );
+      (generateRecapSummary as Mock).mockResolvedValue(
+        'The key concept is "Kemerdekaan". Tanah Melayu achieved independence on 31 August 1957.'
       );
 
       const second = await handleAnswerLoop({
         session_id: testSessionId,
-        answer: "I understand now.",
+        answer: "Saya faham.",
       });
       const { isError, data } = parseToolResponse(second);
 
       expect(isError).toBeFalsy();
       expect(data.completed).toBe(true);
-      expect(data.feedback).toBeDefined();
+      expect(data.feedbacks).toBeDefined();
       expect(data.summary).toBeDefined();
       expect(data.mode).toBe("mcq");
-      expect(data.feedback.propernouns).toContain("Tunku Abdul Rahman");
       expect(data.response).toContain("─── Feedback Summary ───");
-      expect(data.response).toContain("[Feynman Summary]");
-      expect(data.response).toContain("[Kata Nama Khas]");
       expect(data.response).toContain("[Recap]");
+      expect(data.response).toContain("[Kata Nama Khas]");
 
-      expect(callLLMStructured).toHaveBeenCalledTimes(1);
+      expect(saveActiveRecallMessage).toHaveBeenCalled();
+      expect(saveFeedback).toHaveBeenCalledTimes(2);
       expect(saveQuestionLog).toHaveBeenCalledOnce();
       expect(completeSession).toHaveBeenCalledOnce();
 
-      const state = sessions.get(testSessionId)!;
-      expect(state.status).toBe("complete");
-      expect(state.rounds).toBe(1);
+      expect(sessions.get(testSessionId)!.status).toBe("complete");
     });
 
-    it("should omit Kata Nama Khas section when no proper nouns extracted", async () => {
-      (buildTeacherPrompt as Mock).mockReturnValue("feynman system prompt");
+    it("should complete when LLM signals complete before max rounds", async () => {
+      (buildActiveRecallPrompt as Mock).mockReturnValue("active recall system prompt");
       (callLLMStructured as Mock).mockResolvedValueOnce({
-        message: "Tell me more!",
+        message: "First question?",
+        complete: false,
       });
 
       const first = await handleAnswerLoop({ session_id: testSessionId, answer: "B" });
       const { data: firstData } = parseToolResponse(first);
       expect(firstData.completed).toBe(false);
 
-      (passiveFeedback as Mock).mockResolvedValue("feedback content");
-      (passiveSummaries as Mock).mockResolvedValue({ strict: "s", feynman: "f" });
+      // Second round — LLM signals complete
+      (getActiveRecall as Mock).mockReturnValue([
+        { role: "system", content: "prompt" },
+        { role: "user", content: "Begin" },
+        { role: "assistant", content: "First question?" },
+        { role: "user", content: "Saya faham." },
+      ]);
+      (callLLMStructured as Mock).mockResolvedValueOnce({
+        message: "Great, you understand!",
+        complete: true,
+      });
+      (passiveFeedback as Mock).mockResolvedValue("recap content");
       (extractProperNouns as Mock).mockResolvedValue("");
+      (generateRecapSummary as Mock).mockResolvedValue("summary");
 
       const second = await handleAnswerLoop({
         session_id: testSessionId,
-        answer: "I understand now.",
+        answer: "Saya faham.",
       });
       const { isError, data } = parseToolResponse(second);
 
       expect(isError).toBeFalsy();
       expect(data.completed).toBe(true);
-      expect(data.feedback.propernouns).toBe("");
       expect(data.response).toContain("─── Feedback Summary ───");
-      expect(data.response).toContain("[Feynman Summary]");
-      expect(data.response).toContain("[Recap]");
       expect(data.response).not.toContain("[Kata Nama Khas]");
     });
   });

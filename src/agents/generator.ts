@@ -67,6 +67,10 @@ export async function generateQuestion(input: GeneratorInput): Promise<QuizQuest
 async function generateMCQ(input: GeneratorInput): Promise<MCQ> {
   const promptTemplate = loadPrompt("generate_quiz.txt");
 
+  const usedQuestions = input.usedQuestions?.length
+    ? input.usedQuestions.map((q) => `- ${q}`).join("\n")
+    : "(none)";
+
   const systemPrompt = promptTemplate
     .replace("{subjectInstructions}", input.subjectInstructions)
     .replace("{topicName}", input.topicName)
@@ -74,7 +78,8 @@ async function generateMCQ(input: GeneratorInput): Promise<MCQ> {
     .replace(
       "{examQuestions}",
       input.examQuestions.map((q) => `- ${q}`).join("\n") || "(none available)"
-    );
+    )
+    .replace("{usedQuestions}", usedQuestions);
 
   const baseMessages: ChatMessage[] = [
     { role: "system", content: systemPrompt },
@@ -82,7 +87,42 @@ async function generateMCQ(input: GeneratorInput): Promise<MCQ> {
   ];
 
   const maxAttempts = 3;
+  const maxFixAttempts = 3;
+
+  function buildEvalMessages(q: RawMCQ): ChatMessage[] {
+    return [
+      {
+        role: "system",
+        content: evalSystemPrompt
+          .replace("{topicText}", input.topicText)
+          .replace("{question}", q.question)
+          .replace("{options[0]}", q.options[0] || "")
+          .replace("{options[1]}", q.options[1] || "")
+          .replace("{options[2]}", q.options[2] || "")
+          .replace("{options[3]}", q.options[3] || "")
+          .replace("{correctAnswer}", q.correctAnswer)
+          .replace("{explanation}", q.explanation)
+          .replace("{keyword}", q.keyword || ""),
+      },
+      { role: "user", content: "Evaluate this MCQ." },
+    ];
+  }
+
+  function buildFixPrompt(q: RawMCQ, error: string): ChatMessage[] {
+    return [
+      {
+        role: "system",
+        content: "You are an SPM examiner. Fix the MCQ below based on the error. Return valid RawMCQ JSON only. No markdown fences.",
+      },
+      {
+        role: "user",
+        content: `Error: ${error}\n\nMCQ to fix:\n${JSON.stringify(q, null, 2)}\n\nReturn the corrected JSON.`,
+      },
+    ];
+  }
+
   let raw: RawMCQ;
+  let validated = false;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const messages: ChatMessage[] = attempt === 1
@@ -93,48 +133,78 @@ async function generateMCQ(input: GeneratorInput): Promise<MCQ> {
           { role: "user", content: "The previous question had issues. Generate a completely NEW question fixing all issues." },
         ];
 
-    raw = await callLLMStructured<RawMCQ>(messages, {
+    const generated = await callLLMStructured<RawMCQ>(messages, {
       sessionId: input.sessionId,
     });
 
-    const evalResult = await callLLMStructured<EvalResult>(
-      [
-        {
-          role: "system",
-          content: evalSystemPrompt
-            .replace("{topicText}", input.topicText)
-            .replace("{question}", raw.question)
-            .replace("{options[0]}", raw.options[0] || "")
-            .replace("{options[1]}", raw.options[1] || "")
-            .replace("{options[2]}", raw.options[2] || "")
-            .replace("{options[3]}", raw.options[3] || "")
-            .replace("{correctAnswer}", raw.correctAnswer)
-            .replace("{explanation}", raw.explanation)
-            .replace("{keyword}", raw.keyword || ""),
-        },
-        { role: "user", content: "Evaluate this MCQ." },
-      ],
-      { sessionId: input.sessionId }
-    );
+    // Inner fix-validate loop — preserve generated question, don't discard on bad eval
+    let current = generated;
+    validated = false;
 
-    logEvent(input.sessionId, "ctx", {
-      eventType: "eval",
-      attempt,
-      topic: input.topicName,
-      question: raw.question,
-      evalValid: evalResult.valid,
-      evalHasFixed: !!evalResult.fixed,
-    });
+    for (let fix = 0; fix < maxFixAttempts; fix++) {
+      let evalResult: EvalResult;
+      try {
+        evalResult = await callLLMStructured<EvalResult>(
+          buildEvalMessages(current),
+          { sessionId: input.sessionId }
+        );
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        logEvent(input.sessionId, "ctx", {
+          eventType: "eval",
+          attempt,
+          fix,
+          topic: input.topicName,
+          question: current.question,
+          evalValid: false,
+          evalError: errorMsg,
+        });
+        if (fix < maxFixAttempts - 1) {
+          current = await callLLMStructured<RawMCQ>(
+            buildFixPrompt(current, errorMsg),
+            { sessionId: input.sessionId }
+          );
+          continue;
+        }
+        break;
+      }
 
-    if (evalResult.valid) break;
+      logEvent(input.sessionId, "ctx", {
+        eventType: "eval",
+        attempt,
+        fix,
+        topic: input.topicName,
+        question: current.question,
+        evalValid: evalResult.valid,
+        evalHasFixed: !!evalResult.fixed,
+      });
 
-    if (evalResult.fixed) {
-      raw = evalResult.fixed;
+      if (evalResult.valid) {
+        validated = true;
+        break;
+      }
+
+      if (evalResult.fixed) {
+        current = evalResult.fixed;
+        continue;
+      }
+
+      // valid=false, no fixed version — ask LLM to fix
+      if (fix < maxFixAttempts - 1) {
+        current = await callLLMStructured<RawMCQ>(
+          buildFixPrompt(current, "The question failed validation but no corrected version was provided"),
+          { sessionId: input.sessionId }
+        );
+      }
+    }
+
+    if (validated) {
+      raw = current;
       break;
     }
 
     if (attempt === maxAttempts) {
-      throw new Error(`Failed to generate valid MCQ after ${maxAttempts} attempts`);
+      throw new Error(`Failed to generate valid MCQ after ${maxAttempts} generation attempts`);
     }
   }
 
@@ -162,6 +232,10 @@ async function generateMCQ(input: GeneratorInput): Promise<MCQ> {
 async function generateSubjective(input: GeneratorInput): Promise<SubjectiveQuestion> {
   const promptTemplate = loadPrompt("generate_bm_soalan.txt");
 
+  const usedQuestions = input.usedQuestions?.length
+    ? input.usedQuestions.map((q) => `- ${q}`).join("\n")
+    : "(none)";
+
   const systemPrompt = promptTemplate
     .replace("{subjectInstructions}", input.subjectInstructions)
     .replace("{topicName}", input.topicName)
@@ -169,7 +243,8 @@ async function generateSubjective(input: GeneratorInput): Promise<SubjectiveQues
     .replace(
       "{examQuestions}",
       input.examQuestions.map((q) => `- ${q}`).join("\n") || "(none available)"
-    );
+    )
+    .replace("{usedQuestions}", usedQuestions);
 
   const messages: ChatMessage[] = [
     { role: "system", content: systemPrompt },

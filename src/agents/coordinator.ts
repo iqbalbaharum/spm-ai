@@ -1,17 +1,29 @@
 import chalk from "chalk";
 import { generateQuestion } from "./generator.js";
-import { activeDialogue, evaluateSubjective, passiveFeedback, passiveSummaries, extractProperNouns } from "./teachers.js";
+import {
+  buildActiveRecallPrompt,
+  passiveFeedback,
+  extractProperNouns,
+  generateRecapSummary,
+} from "./teachers.js";
+import { callLLMStructured } from "./llm.js";
 import { getParetoTopics, getTopicWithQuestions } from "../db/neo4j.js";
-import { createSession, saveQuestionLog, completeSession } from "../db/sqlite.js";
+import {
+  createSession,
+  saveQuestionLog,
+  saveActiveRecallMessage,
+  saveFeedback,
+  completeSession,
+  getUsedQuestions,
+  getFeedbacks,
+} from "../db/sqlite.js";
 import { config } from "../config.js";
-import { logEvent } from "./llm.js";
 import type {
   TopicSummary,
-  QuestionRecord,
-  PassiveFeedback,
-  DialogueContext,
   SubjectConfig,
   QuizQuestion,
+  DialogueContext,
+  ActiveRecallResponse,
 } from "../types.js";
 import { isMcq } from "../types.js";
 
@@ -30,6 +42,8 @@ function sessionId(): string {
   const rand = Math.random().toString(36).slice(2, 6);
   return `${date}-cli-${rand}`;
 }
+
+const MAX_ACTIVE_RECALL_ROUNDS = 3;
 
 export async function runQuiz(
   count: number,
@@ -57,10 +71,6 @@ export async function runQuiz(
   const sid = sessionId();
   createSession(sid, activeSubject);
 
-  logEvent(sid, "ctx", { type: "pareto", selected: selected.map((t) => ({ name: t.name, subject: t.subject, form: t.form, chapter: t.chapter, questionCount: t.questionCount })) });
-
-  const records: QuestionRecord[] = [];
-
   for (let i = 0; i < selected.length; i++) {
     const topic = selected[i];
     console.log(
@@ -71,7 +81,8 @@ export async function runQuiz(
     console.log(chalk.dim(`  Topic: ${topic.name}\n`));
 
     const topicData = await getTopicWithQuestions(topic.name);
-    logEvent(sid, "ctx", { type: "topic", topicName: topicData.name, topicText: topicData.text, examQuestions: topicData.examQuestions });
+
+    const usedQuestions = getUsedQuestions("cli", topic.name);
 
     const question = await generateQuestion({
       topicName: topic.name,
@@ -80,6 +91,7 @@ export async function runQuiz(
       subjectInstructions: subjectConfig.instructions,
       mode: subjectConfig.mode,
       sessionId: sid,
+      usedQuestions,
     });
 
     displayQuestion(question, subjectConfig.mode);
@@ -87,45 +99,19 @@ export async function runQuiz(
     const answer = (await getUserInput()).trim();
 
     if (answer === "/skip") {
-      records.push({
+      saveQuestionLog(sid, {
         seq: i + 1,
         topic: topic.name,
         question,
         studentAnswer: null,
-        correct: null,
-        activeTeacher: null,
-        dialogue: [],
-        feedback: { strict: "", feynman: "", recap: "", kbat: "", propernouns: "" },
       });
       console.log(chalk.yellow("  Skipped.\n"));
       continue;
     }
 
-    let correct: boolean;
-    let evalResult: DialogueContext["evalResult"] | undefined;
-
-    if (isMcq(question)) {
-      correct = answer.toUpperCase() === question.correctAnswer;
-    } else {
-      const ctx: DialogueContext = {
-        question,
-        studentAnswer: answer,
-        correct: false,
-        topic: topic.name,
-        topicText: topicData.text,
-        examQuestions: topicData.examQuestions,
-        subjectInstructions: subjectConfig.instructions,
-        sessionId: sid,
-      };
-      evalResult = await evaluateSubjective(ctx);
-      correct = evalResult.feynmanEligible;
-    }
-
     const ctx: DialogueContext = {
       question,
       studentAnswer: answer,
-      correct,
-      evalResult,
       topic: topic.name,
       topicText: topicData.text,
       examQuestions: topicData.examQuestions,
@@ -133,63 +119,92 @@ export async function runQuiz(
       sessionId: sid,
     };
 
-    if (correct) {
-      console.log(chalk.green(`  ✓ Good!\n`));
-    } else {
-      console.log(chalk.red(`  ✗ Needs improvement.\n`));
+    // Active recall
+    const systemPrompt = buildActiveRecallPrompt(ctx);
+    saveActiveRecallMessage(sid, "system", systemPrompt);
+
+    const initialUserMsg = isMcq(question)
+      ? `The student answered "${answer}". Begin the active recall session.`
+      : `The student submitted their essay. Begin the active recall session.`;
+
+    saveActiveRecallMessage(sid, "user", initialUserMsg);
+
+    const messages: { role: string; content: string }[] = [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: initialUserMsg },
+    ];
+
+    let complete = false;
+    let rounds = 0;
+
+    while (!complete && rounds < MAX_ACTIVE_RECALL_ROUNDS) {
+      const result = await callLLMStructured<ActiveRecallResponse>(
+        messages.map((m) => ({ role: m.role as "system" | "user" | "assistant", content: m.content })),
+        { sessionId: sid }
+      );
+
+      messages.push({ role: "assistant", content: result.message });
+      saveActiveRecallMessage(sid, "assistant", result.message);
+
+      console.log(`\n  [Tutor]: ${result.message}\n`);
+
+      if (result.complete) {
+        complete = true;
+        break;
+      }
+
+      const userInput = await getUserInput();
+      if (userInput.toLowerCase() === "/done") break;
+
+      messages.push({ role: "user", content: userInput });
+      saveActiveRecallMessage(sid, "user", userInput);
+      rounds++;
     }
 
-    const activeTeacher = correct ? "feynman" : "strict";
-    const dialogue = await activeDialogue(activeTeacher, ctx, getUserInput);
-
+    // Passive feedback
     console.log(chalk.dim("\n  ─── Feedback ───\n"));
 
-    const feedback: PassiveFeedback = {
-      strict: "",
-      feynman: "",
-      recap: "",
-      kbat: "",
-      propernouns: "",
-    };
-
+    let recap = "";
     if (subjectConfig.passiveFeedback.includes("recap")) {
-      feedback.recap = await passiveFeedback("recap", ctx).catch(() => "");
+      recap = await passiveFeedback("recap", ctx).catch(() => "");
     }
+    let propernouns = "";
     if (subjectConfig.passiveFeedback.includes("propernouns")) {
-      feedback.propernouns = await extractProperNouns(ctx).catch(() => "");
+      propernouns = await extractProperNouns(ctx).catch(() => "");
     }
 
-    displayFeedback(activeTeacher, feedback, subjectConfig);
+    if (recap) saveFeedback(sid, "recap", recap);
+    if (propernouns) saveFeedback(sid, "propernouns", propernouns);
 
-    records.push({
+    const summary = await generateRecapSummary(ctx);
+    console.log(chalk.dim(`  [Summary]`));
+    console.log(`  ${summary}\n`);
+
+    if (recap) {
+      console.log(chalk.dim(`  [Recap]`));
+      console.log(`  ${recap}\n`);
+    }
+    if (propernouns) {
+      console.log(chalk.dim(`  [Kata Nama Khas]`));
+      console.log(`  ${propernouns}\n`);
+    }
+
+    saveQuestionLog(sid, {
       seq: i + 1,
       topic: topic.name,
       question,
       studentAnswer: answer,
-      correct,
-      evalResult,
-      activeTeacher,
-      dialogue,
-      feedback,
     });
 
     if (i < selected.length - 1) {
-      console.log(chalk.dim("\n  Press Enter for next question..."));
+      console.log(chalk.dim("  Press Enter for next question..."));
       await getUserInput();
     }
   }
 
-  const answered = records.filter((r) => r.studentAnswer !== null);
-  const correctCount = answered.filter((r) => r.correct).length;
-  const summary = { total: records.length, answered: answered.length, correct: correctCount };
-
-  for (const r of records) {
-    saveQuestionLog(sid, r);
-  }
-  completeSession(sid, summary);
+  completeSession(sid, { total: selected.length });
 
   console.log(chalk.bold("\n  ═══════ Session Complete ═══════"));
-  console.log(chalk.green(`  Score: ${correctCount}/${records.length} (${Math.round((correctCount / records.length) * 100)}%)\n`));
 }
 
 function displayQuestion(question: QuizQuestion, mode: string): void {
@@ -203,26 +218,5 @@ function displayQuestion(question: QuizQuestion, mode: string): void {
   } else {
     console.log(chalk.dim(`  Marking Scheme: ${question.markingScheme}\n`));
     process.stdout.write(chalk.cyan("  Your answer (text) or /skip: "));
-  }
-}
-
-function displayFeedback(
-  activeTeacher: string,
-  feedback: PassiveFeedback,
-  subjectConfig: SubjectConfig
-): void {
-  const teacherCfg = subjectConfig.teachers[activeTeacher];
-  const label = teacherCfg?.displayName || activeTeacher;
-  console.log(chalk.dim(`  [${label} Summary]`));
-  console.log(`  ${(activeTeacher === "feynman" ? feedback.feynman : feedback.strict) || "(completed)"}\n`);
-
-  if (feedback.recap) {
-    console.log(chalk.dim(`  [Recap]`));
-    console.log(`  ${feedback.recap}\n`);
-  }
-
-  if (feedback.propernouns) {
-    console.log(chalk.dim(`  [Kata Nama Khas]`));
-    console.log(`  ${feedback.propernouns}\n`);
   }
 }

@@ -8,6 +8,9 @@ TOPIC: "{topicName}"
 REFERENCE EXAM QUESTIONS (for style only, do NOT repeat verbatim):
 {examQuestions}
 
+PREVIOUSLY ASKED QUESTIONS (do NOT repeat any of these):
+{usedQuestions}
+
 Rules:
 - Question must be answerable from the topic text
 - 4 options, one correct, 3 plausible distractors (common student mistakes)

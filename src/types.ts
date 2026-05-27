@@ -25,11 +25,6 @@ export interface ChatMessage {
   content: string;
 }
 
-export interface LLMResponse {
-  content: string;
-  dialogueComplete?: boolean;
-}
-
 export interface LLMOptions {
   model?: string;
   maxTokens?: number;
@@ -43,33 +38,34 @@ export interface GeneratorInput {
   subjectInstructions: string;
   mode: QuizMode;
   sessionId?: string;
+  usedQuestions?: string[];
 }
 
-export interface EvalResult {
-  feynmanEligible: boolean;
-  score?: number;
-  maxScore?: number;
-  feedback: string;
+export interface ActiveRecallMessage {
+  id?: number;
+  sessionId: string;
+  role: "system" | "user" | "assistant";
+  content: string;
+  createdAt?: string;
+}
+
+export interface FeedbackRecord {
+  id?: number;
+  sessionId: string;
+  instructor: string;
+  text: string;
+  createdAt?: string;
 }
 
 export interface DialogueContext {
   question: QuizQuestion;
   studentAnswer: string;
-  correct: boolean;
-  evalResult?: EvalResult;
   topic: string;
   topicText: string;
   examQuestions: string[];
   subjectInstructions: string;
   sessionId?: string;
-}
-
-export interface PassiveFeedback {
-  strict: string;
-  feynman: string;
-  recap: string;
-  kbat: string;
-  propernouns: string;
+  usedQuestions?: string[];
 }
 
 export interface QuestionRecord {
@@ -77,11 +73,6 @@ export interface QuestionRecord {
   topic: string;
   question: QuizQuestion;
   studentAnswer: string | null;
-  correct: boolean | null;
-  evalResult?: EvalResult | null;
-  activeTeacher: "strict" | "feynman" | null;
-  dialogue: ChatMessage[];
-  feedback: PassiveFeedback;
 }
 
 export interface SessionRecord {
@@ -91,7 +82,6 @@ export interface SessionRecord {
   startedAt: string;
   completedAt: string | null;
   questions: QuestionRecord[];
-  summary: { total: number; answered: number; correct: number };
 }
 
 export interface TopicSummary {
@@ -124,6 +114,7 @@ export interface TopicWithQuestions {
   examQuestions: string[];
 }
 
-export interface TeacherResponse {
+export interface ActiveRecallResponse {
   message: string;
+  complete: boolean;
 }

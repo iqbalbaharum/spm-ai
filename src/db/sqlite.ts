@@ -2,7 +2,8 @@ import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { QuestionRecord } from "../types.js";
+import type { QuizQuestion } from "../types.js";
+import { isMcq } from "../types.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const stageDir = join(__dirname, "../../.stage/spmai");
@@ -10,41 +11,148 @@ mkdirSync(stageDir, { recursive: true });
 
 const db = new Database(join(stageDir, "sessions.db"));
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS sessions (
-    id             TEXT PRIMARY KEY,
-    user_id        TEXT NOT NULL DEFAULT 'cli',
-    subject        TEXT NOT NULL DEFAULT 'Sejarah',
-    started_at     TEXT NOT NULL,
-    completed_at   TEXT,
-    summary        TEXT NOT NULL DEFAULT '{}',
-    session_state  TEXT
-  );
+// Enable WAL mode for better concurrent access
+db.pragma("journal_mode = WAL");
 
-  CREATE TABLE IF NOT EXISTS question_logs (
-    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id       TEXT NOT NULL REFERENCES sessions(id),
-    seq              INTEGER NOT NULL,
-    topic            TEXT NOT NULL,
-    mcq              TEXT NOT NULL,
-    student_answer   TEXT,
-    correct          INTEGER,
-    active_teacher   TEXT,
-    dialogue         TEXT,
-    feedback_strict  TEXT,
-    feedback_feynman TEXT,
-    feedback_recap   TEXT,
-    feedback_kbat    TEXT,
-    feedback_propernouns TEXT,
-    created_at       TEXT NOT NULL
-  );
-`);
+export function initDb(): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      id             TEXT PRIMARY KEY,
+      user_id        TEXT NOT NULL DEFAULT 'cli',
+      subject        TEXT NOT NULL DEFAULT 'Sejarah',
+      started_at     TEXT NOT NULL,
+      completed_at   TEXT,
+      summary        TEXT NOT NULL DEFAULT '{}'
+    );
 
-// Migration: add feedback_propernouns column for existing databases
-try {
-  db.exec("ALTER TABLE question_logs ADD COLUMN feedback_propernouns TEXT");
-} catch {
-  // column already exists — safe to ignore
+    CREATE TABLE IF NOT EXISTS question_logs (
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id       TEXT NOT NULL REFERENCES sessions(id),
+      seq              INTEGER NOT NULL,
+      topic            TEXT NOT NULL,
+      question         TEXT NOT NULL,
+      options          TEXT,
+      correct_answer   TEXT,
+      keyword          TEXT,
+      student_answer   TEXT,
+      created_at       TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS active_recall (
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id       TEXT NOT NULL REFERENCES sessions(id),
+      role             TEXT NOT NULL,
+      content          TEXT NOT NULL,
+      created_at       TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS feedback (
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id       TEXT NOT NULL REFERENCES sessions(id),
+      instructor       TEXT NOT NULL,
+      text             TEXT NOT NULL,
+      created_at       TEXT NOT NULL
+    );
+  `);
+
+  migrateFromLegacy();
+}
+
+function migrateFromLegacy(): void {
+  // Check if legacy mcq column exists
+  const cols = db.prepare("PRAGMA table_info(question_logs)").all() as { name: string }[];
+  const hasMcq = cols.some((c) => c.name === "mcq");
+  if (!hasMcq) return; // already migrated
+
+  // Add new columns if they don't exist
+  const hasQuestion = cols.some((c) => c.name === "question");
+  if (!hasQuestion) {
+    db.exec("ALTER TABLE question_logs ADD COLUMN question TEXT");
+    db.exec("ALTER TABLE question_logs ADD COLUMN options TEXT");
+    db.exec("ALTER TABLE question_logs ADD COLUMN correct_answer TEXT");
+    db.exec("ALTER TABLE question_logs ADD COLUMN keyword TEXT");
+  }
+
+  // Migrate mcq JSON → new columns
+  const rows = db.prepare(
+    "SELECT id, mcq, dialogue, feedback_strict, feedback_feynman, feedback_recap, feedback_kbat, feedback_propernouns FROM question_logs WHERE question IS NULL OR question = ''"
+  ).all() as {
+    id: number;
+    mcq: string;
+    dialogue: string | null;
+    feedback_strict: string | null;
+    feedback_feynman: string | null;
+    feedback_recap: string | null;
+    feedback_kbat: string | null;
+    feedback_propernouns: string | null;
+  }[];
+
+  for (const row of rows) {
+    try {
+      const parsed = JSON.parse(row.mcq);
+      db.prepare(
+        "UPDATE question_logs SET question = ?, options = ?, correct_answer = ?, keyword = ? WHERE id = ?"
+      ).run(
+        parsed.question || "",
+        parsed.options ? JSON.stringify(parsed.options) : null,
+        parsed.correctAnswer || null,
+        parsed.keyword || null,
+        row.id
+      );
+    } catch {
+      // skip malformed JSON
+    }
+
+    // Migrate dialogue → active_recall
+    if (row.dialogue) {
+      try {
+        const messages = JSON.parse(row.dialogue) as { role: string; content: string }[];
+        const insert = db.prepare(
+          "INSERT INTO active_recall (session_id, role, content, created_at) VALUES (?, ?, ?, ?)"
+        );
+        const now = new Date().toISOString();
+        for (const msg of messages) {
+          insert.run(
+            (db.prepare("SELECT session_id FROM question_logs WHERE id = ?").get(row.id) as { session_id: string }).session_id,
+            msg.role,
+            msg.content,
+            now
+          );
+        }
+      } catch {
+        // skip malformed dialogue
+      }
+    }
+
+    // Migrate feedback_* → feedback
+    type FeedbackEntry = { instructor: string; text: string | null };
+    const feedbacks: FeedbackEntry[] = [
+      { instructor: "strict", text: row.feedback_strict },
+      { instructor: "feynman", text: row.feedback_feynman },
+      { instructor: "recap", text: row.feedback_recap },
+      { instructor: "kbat", text: row.feedback_kbat },
+      { instructor: "propernouns", text: row.feedback_propernouns },
+    ];
+    const sessionId = (db.prepare("SELECT session_id FROM question_logs WHERE id = ?").get(row.id) as { session_id: string }).session_id;
+    const fbInsert = db.prepare(
+      "INSERT INTO feedback (session_id, instructor, text, created_at) VALUES (?, ?, ?, ?)"
+    );
+    const now = new Date().toISOString();
+    for (const fb of feedbacks) {
+      if (fb.text && fb.text.trim()) {
+        fbInsert.run(sessionId, fb.instructor, fb.text, now);
+      }
+    }
+  }
+
+  // Drop legacy columns (SQLite 3.35.0+ supports DROP COLUMN)
+  for (const col of ["mcq", "dialogue", "feedback_strict", "feedback_feynman", "feedback_recap", "feedback_kbat", "feedback_propernouns", "active_teacher"]) {
+    try {
+      db.exec(`ALTER TABLE question_logs DROP COLUMN ${col}`);
+    } catch {
+      // column may not exist
+    }
+  }
 }
 
 export function createSession(
@@ -60,49 +168,67 @@ export function createSession(
 
 export function saveQuestionLog(
   sessionId: string,
-  q: QuestionRecord
+  q: {
+    seq: number;
+    topic: string;
+    question: QuizQuestion;
+    studentAnswer: string | null;
+  }
 ): void {
   const stmt = db.prepare(`
     INSERT INTO question_logs
-      (session_id, seq, topic, mcq, student_answer, correct,
-       active_teacher, dialogue, feedback_strict, feedback_feynman,
-       feedback_recap, feedback_kbat, feedback_propernouns, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (session_id, seq, topic, question, options, correct_answer, keyword, student_answer, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
+
+  let options: string | null = null;
+  let correctAnswer: string | null = null;
+  let keyword = "";
+
+  if (isMcq(q.question)) {
+    options = JSON.stringify(q.question.options);
+    correctAnswer = q.question.correctAnswer;
+    keyword = q.question.keyword;
+  } else {
+    keyword = q.question.keyword;
+  }
 
   stmt.run(
     sessionId,
     q.seq,
     q.topic,
-    JSON.stringify(q.question),
+    q.question.question,
+    options,
+    correctAnswer,
+    keyword,
     q.studentAnswer,
-    q.correct ? 1 : 0,
-    q.activeTeacher,
-    JSON.stringify(q.dialogue),
-    q.feedback.strict,
-    q.feedback.feynman,
-    q.feedback.recap,
-    q.feedback.kbat,
-    q.feedback.propernouns,
     new Date().toISOString()
   );
 }
 
-export function saveSessionState(sessionId: string, state: unknown): void {
-  db.prepare("UPDATE sessions SET session_state = ? WHERE id = ?")
-    .run(JSON.stringify(state), sessionId);
+export function saveActiveRecallMessage(
+  sessionId: string,
+  role: string,
+  content: string
+): void {
+  db.prepare(
+    "INSERT INTO active_recall (session_id, role, content, created_at) VALUES (?, ?, ?, ?)"
+  ).run(sessionId, role, content, new Date().toISOString());
 }
 
-export function loadSessionState(sessionId: string): unknown | null {
-  const row = db
-    .prepare("SELECT session_state FROM sessions WHERE id = ?")
-    .get(sessionId) as { session_state: string | null } | undefined;
-  return row?.session_state ? JSON.parse(row.session_state) : null;
+export function saveFeedback(
+  sessionId: string,
+  instructor: string,
+  text: string
+): void {
+  db.prepare(
+    "INSERT INTO feedback (session_id, instructor, text, created_at) VALUES (?, ?, ?, ?)"
+  ).run(sessionId, instructor, text, new Date().toISOString());
 }
 
 export function completeSession(
   sessionId: string,
-  summary: { total: number; answered: number; correct: number }
+  summary: Record<string, unknown>
 ): void {
   const stmt = db.prepare(`
     UPDATE sessions SET completed_at = ?, summary = ?
@@ -128,7 +254,12 @@ export function getSessionHistory(): Array<{
 
 export function getSessionDetail(
   sessionId: string
-): { session: Record<string, unknown>; questions: Record<string, unknown>[] } | null {
+): {
+  session: Record<string, unknown>;
+  questions: Record<string, unknown>[];
+  activeRecall: Record<string, unknown>[];
+  feedbacks: Record<string, unknown>[];
+} | null {
   const session = db
     .prepare("SELECT * FROM sessions WHERE id = ?")
     .get(sessionId) as Record<string, unknown> | undefined;
@@ -141,5 +272,49 @@ export function getSessionDetail(
     )
     .all(sessionId) as Record<string, unknown>[];
 
-  return { session, questions };
+  const activeRecall = db
+    .prepare(
+      "SELECT * FROM active_recall WHERE session_id = ? ORDER BY id"
+    )
+    .all(sessionId) as Record<string, unknown>[];
+
+  const feedbacks = db
+    .prepare(
+      "SELECT * FROM feedback WHERE session_id = ? ORDER BY id"
+    )
+    .all(sessionId) as Record<string, unknown>[];
+
+  return { session, questions, activeRecall, feedbacks };
 }
+
+export function getUsedQuestions(userId: string, topic: string): string[] {
+  const rows = db
+    .prepare(`
+      SELECT ql.question FROM question_logs ql
+      JOIN sessions s ON s.id = ql.session_id
+      WHERE s.user_id = ? AND ql.topic = ?
+      ORDER BY ql.created_at DESC
+    `)
+    .all(userId, topic) as { question: string }[];
+
+  return rows.map((r) => r.question).filter(Boolean);
+}
+
+export function getActiveRecall(sessionId: string): { role: string; content: string }[] {
+  return db
+    .prepare(
+      "SELECT role, content FROM active_recall WHERE session_id = ? ORDER BY id"
+    )
+    .all(sessionId) as { role: string; content: string }[];
+}
+
+export function getFeedbacks(sessionId: string): { instructor: string; text: string }[] {
+  return db
+    .prepare(
+      "SELECT instructor, text FROM feedback WHERE session_id = ? ORDER BY id"
+    )
+    .all(sessionId) as { instructor: string; text: string }[];
+}
+
+// Run init on import
+initDb();

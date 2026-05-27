@@ -8,6 +8,9 @@ TOPIC: "{topicName}"
 REFERENCE EXAM QUESTIONS (for style only, do NOT repeat verbatim):
 {examQuestions}
 
+PREVIOUSLY ASKED QUESTIONS (do NOT repeat any of these):
+{usedQuestions}
+
 Rules:
 - Question must be a typical SPM Bahasa Melayu essay/structured question
 - Provide a DETAILED marking scheme showing mark allocation (e.g., "Definisi: 2 markah", "3 isi: 6 markah", "Contoh: 2 markah")
