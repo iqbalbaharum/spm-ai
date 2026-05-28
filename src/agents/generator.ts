@@ -11,6 +11,24 @@ function loadPrompt(name: string): string {
   return readFileSync(join(promptDir, name), "utf-8");
 }
 
+function stripYamlFrontmatter(text: string): string {
+  return text.replace(/^---[\s\S]*?---\n*/, "");
+}
+
+function stripWikiLinks(text: string): string {
+  return text.replace(/\[\[[^\]]+\]\]/g, "");
+}
+
+function stripExamWrappers(text: string): string {
+  return text
+    .replace(/:::subjective_part\s*\{[^}]*\}\s*/g, "")
+    .replace(/^:::\s*$/gm, "");
+}
+
+function cleanTopicText(text: string): string {
+  return stripWikiLinks(stripYamlFrontmatter(text));
+}
+
 interface RawMCQ {
   question: string;
   options: string[];
@@ -74,10 +92,10 @@ async function generateMCQ(input: GeneratorInput): Promise<MCQ> {
   const systemPrompt = promptTemplate
     .replace("{subjectInstructions}", input.subjectInstructions)
     .replace("{topicName}", input.topicName)
-    .replace("{topicText}", input.topicText)
+    .replace("{topicText}", cleanTopicText(input.topicText))
     .replace(
       "{examQuestions}",
-      input.examQuestions.map((q) => `- ${q}`).join("\n") || "(none available)"
+      input.examQuestions.map((q) => `- ${stripExamWrappers(q)}`).join("\n") || "(none available)"
     )
     .replace("{usedQuestions}", usedQuestions);
 
@@ -94,7 +112,7 @@ async function generateMCQ(input: GeneratorInput): Promise<MCQ> {
       {
         role: "system",
         content: evalSystemPrompt
-          .replace("{topicText}", input.topicText)
+          .replace("{topicText}", cleanTopicText(input.topicText))
           .replace("{question}", q.question)
           .replace("{options[0]}", q.options[0] || "")
           .replace("{options[1]}", q.options[1] || "")
@@ -185,6 +203,10 @@ async function generateMCQ(input: GeneratorInput): Promise<MCQ> {
       }
 
       if (evalResult.fixed) {
+        if (JSON.stringify(evalResult.fixed) === JSON.stringify(current)) {
+          validated = true;
+          break;
+        }
         current = evalResult.fixed;
         continue;
       }
@@ -209,15 +231,16 @@ async function generateMCQ(input: GeneratorInput): Promise<MCQ> {
   }
 
   const rawOut = raw!;
+  const cleanText = cleanTopicText(input.topicText);
 
   let keyword = rawOut.keyword?.trim() || "";
 
-  if (!isValidKeyword(keyword, input.topicText)) {
-    keyword = await retryKeyword(input.topicText, input.sessionId);
+  if (!isValidKeyword(keyword, cleanText)) {
+    keyword = await retryKeyword(cleanText, input.sessionId);
   }
 
-  if (!isValidKeyword(keyword, input.topicText)) {
-    keyword = extractKeyword(input.topicText);
+  if (!isValidKeyword(keyword, cleanText)) {
+    keyword = extractKeyword(cleanText);
   }
 
   return {
@@ -239,10 +262,10 @@ async function generateSubjective(input: GeneratorInput): Promise<SubjectiveQues
   const systemPrompt = promptTemplate
     .replace("{subjectInstructions}", input.subjectInstructions)
     .replace("{topicName}", input.topicName)
-    .replace("{topicText}", input.topicText)
+    .replace("{topicText}", cleanTopicText(input.topicText))
     .replace(
       "{examQuestions}",
-      input.examQuestions.map((q) => `- ${q}`).join("\n") || "(none available)"
+      input.examQuestions.map((q) => `- ${stripExamWrappers(q)}`).join("\n") || "(none available)"
     )
     .replace("{usedQuestions}", usedQuestions);
 
@@ -258,7 +281,7 @@ async function generateSubjective(input: GeneratorInput): Promise<SubjectiveQues
   return {
     question: raw.question,
     markingScheme: raw.markingScheme,
-    keyword: raw.keyword?.trim() || extractKeyword(input.topicText),
+    keyword: raw.keyword?.trim() || extractKeyword(cleanTopicText(input.topicText)),
   };
 }
 

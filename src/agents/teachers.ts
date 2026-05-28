@@ -12,6 +12,24 @@ function loadPrompt(name: string): string {
   return readFileSync(join(promptDir, name), "utf-8");
 }
 
+function stripYamlFrontmatter(text: string): string {
+  return text.replace(/^---[\s\S]*?---\n*/, "");
+}
+
+function stripWikiLinks(text: string): string {
+  return text.replace(/\[\[[^\]]+\]\]/g, "");
+}
+
+function stripExamWrappers(text: string): string {
+  return text
+    .replace(/:::subjective_part\s*\{[^}]*\}\s*/g, "")
+    .replace(/^:::\s*$/gm, "");
+}
+
+function cleanTopicText(text: string): string {
+  return stripWikiLinks(stripYamlFrontmatter(text));
+}
+
 function getKeyword(ctx: DialogueContext): string {
   return "keyword" in ctx.question ? ctx.question.keyword : "";
 }
@@ -23,23 +41,19 @@ export function buildActiveRecallPrompt(ctx: DialogueContext): string {
   let result = template
     .replace("{subjectInstructions}", ctx.subjectInstructions)
     .replace("{topic}", ctx.topic)
-    .replace("{topicText}", ctx.topicText)
+    .replace("{topicText}", cleanTopicText(ctx.topicText))
     .replace("{question}", q.question)
     .replace("{studentAnswer}", ctx.studentAnswer)
     .replace("{keyword}", getKeyword(ctx))
     .replace(
       "{examQuestions}",
-      ctx.examQuestions.map((x) => `- ${x}`).join("\n") || "(none available)"
+      ctx.examQuestions.map((x) => `- ${stripExamWrappers(x)}`).join("\n") || "(none available)"
     );
 
   if (isMcq(q)) {
-    result = result
-      .replace("{correctAnswer}", q.correctAnswer)
-      .replace("{explanation}", q.explanation);
+    result = result.replace("{correctAnswer}", q.correctAnswer);
   } else {
-    result = result
-      .replace("{correctAnswer}", "N/A")
-      .replace("{explanation}", q.markingScheme);
+    result = result.replace("{correctAnswer}", "N/A");
   }
 
   return result;
@@ -61,10 +75,10 @@ export async function passiveFeedback(
     .replace("{keyword}", getKeyword(ctx))
     .replace("{studentAnswer}", ctx.studentAnswer)
     .replace("{isCorrect}", isCorrect ? "benar" : "tidak tepat")
-    .replace("{topicText}", ctx.topicText)
+    .replace("{topicText}", cleanTopicText(ctx.topicText))
     .replace(
       "{examQuestions}",
-      ctx.examQuestions.map((x) => `- ${x}`).join("\n") || "(none available)"
+      ctx.examQuestions.map((x) => `- ${stripExamWrappers(x)}`).join("\n") || "(none available)"
     );
 
   if (isMcq(q)) {
@@ -96,7 +110,7 @@ export async function extractProperNouns(
 
   const filled = template
     .replace("{subjectInstructions}", ctx.subjectInstructions)
-    .replace("{topicText}", ctx.topicText);
+    .replace("{topicText}", cleanTopicText(ctx.topicText));
 
   try {
     const result = await callLLMStructured<{ items: ProperNounsItem[] }>(
@@ -151,7 +165,7 @@ You are an SPM examiner. Evaluate the student's essay against the marking scheme
 
 Question: "${q.question}"
 Marking Scheme: "${q.markingScheme}"
-Topic Content: "${ctx.topicText}"
+Topic Content: "${cleanTopicText(ctx.topicText)}"
 
 Student's Essay: "${ctx.studentAnswer}"
 

@@ -4,7 +4,7 @@ You are an SPM tutor conducting an active recall session.
 
 Topic: {topic}
 Question: {question}
-Correct answer: {correctAnswer} — {explanation}
+Correct answer: {correctAnswer}
 Student answered: {studentAnswer}
 Keyword: {keyword}
 
