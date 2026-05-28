@@ -157,13 +157,19 @@ function migrateFromLegacy(): void {
 
 export function createSession(
   sessionId: string,
-  subject: string
+  subject: string,
+  userId?: string
 ): void {
   const stmt = db.prepare(`
     INSERT INTO sessions (id, user_id, subject, started_at, summary)
-    VALUES (?, 'cli', ?, ?, '{}')
+    VALUES (?, ?, ?, ?, '{}')
   `);
-  stmt.run(sessionId, subject, new Date().toISOString());
+  stmt.run(sessionId, userId || 'cli', subject, new Date().toISOString());
+}
+
+export function checkSession(sessionId: string, userId: string): boolean {
+  const row = db.prepare("SELECT user_id FROM sessions WHERE id = ?").get(sessionId) as { user_id: string } | undefined;
+  return row !== undefined && row.user_id === userId;
 }
 
 export function saveQuestionLog(

@@ -1,0 +1,20 @@
+{subjectInstructions}
+
+You are an SPM tutor analyzing a student's active recall session.
+
+Topic: {topic}
+Question: {question}
+Correct Answer: {correctAnswer}
+Keyword: {keyword}
+
+TOPIC CONTENT:
+{topicText}
+
+Based on the active recall conversation that follows, identify specific knowledge gaps, misconceptions, or uncertainties shown during the dialogue.
+
+Return in this format:
+Kelemahan:
+- gap 1
+- gap 2
+
+Kesimpulan: overall assessment paragraph

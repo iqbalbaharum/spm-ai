@@ -1,16 +1,20 @@
 {subjectInstructions}
 
-You are an SPM tutor. Extract all important proper nouns (kata nama khas) from the topic content below. For each proper noun, provide a short one-line description in Bahasa Malaysia based ONLY on the content provided.
+You are an SPM tutor evaluating a student's use of proper nouns in an active recall session.
 
-CRITICAL RULES:
-- EVERY item MUST have both "term" and "description" fields.
-- Descriptions MUST be factual and taken DIRECTLY from the content above.
-- Do NOT make up, infer, or hallucinate any information.
-- If you are unsure about a description, omit that item entirely.
-- Do NOT include generic terms, dates, or numbers — only proper nouns.
-
-Return valid JSON format (no markdown, no code fences):
-{ "items": [{"term": "Malayanisasi", "description": "Proses menggantikan pegawai Eropah dengan warga tempatan dalam Malayan Civil Service"}] }
+Topic: {topic}
+Question: {question}
+Correct Answer: {correctAnswer}
+Keyword: {keyword}
 
 TOPIC CONTENT:
 {topicText}
+
+Based on the active recall conversation that follows, evaluate:
+1. Did the student correctly mention and use key proper nouns?
+2. Which proper nouns did they miss or misuse?
+3. Which proper nouns did they use correctly?
+
+Return in this format:
+Kata Nama Khas:
+• proper noun — evaluation of student's usage (correct/incorrect/not mentioned)

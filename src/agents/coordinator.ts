@@ -2,9 +2,10 @@ import chalk from "chalk";
 import { generateQuestion } from "./generator.js";
 import {
   buildActiveRecallPrompt,
-  passiveFeedback,
+  recapFeedback,
   extractProperNouns,
   generateRecapSummary,
+  analyzeKnowledgeGaps,
 } from "./teachers.js";
 import { callLLMStructured } from "./llm.js";
 import { getParetoTopics, getTopicWithQuestions } from "../db/neo4j.js";
@@ -64,8 +65,7 @@ export async function runQuiz(
     language: "Bahasa Malaysia",
     instructions: "",
     mode: "mcq",
-    teachers: {},
-    passiveFeedback: [],
+    feedbacks: [],
     prompts: { generate: "generate_quiz.txt" },
   };
   const sid = sessionId();
@@ -161,32 +161,30 @@ export async function runQuiz(
       rounds++;
     }
 
-    // Passive feedback
+    // Unified feedback loop
     console.log(chalk.dim("\n  ─── Feedback ───\n"));
 
-    let recap = "";
-    if (subjectConfig.passiveFeedback.includes("recap")) {
-      recap = await passiveFeedback("recap", ctx).catch(() => "");
-    }
-    let propernouns = "";
-    if (subjectConfig.passiveFeedback.includes("propernouns")) {
-      propernouns = await extractProperNouns(ctx).catch(() => "");
-    }
-
-    if (recap) saveFeedback(sid, "recap", recap);
-    if (propernouns) saveFeedback(sid, "propernouns", propernouns);
-
-    const summary = await generateRecapSummary(ctx);
-    console.log(chalk.dim(`  [Summary]`));
-    console.log(`  ${summary}\n`);
-
-    if (recap) {
-      console.log(chalk.dim(`  [Recap]`));
-      console.log(`  ${recap}\n`);
-    }
-    if (propernouns) {
-      console.log(chalk.dim(`  [Kata Nama Khas]`));
-      console.log(`  ${propernouns}\n`);
+    for (const fb of subjectConfig.feedbacks) {
+      let text = "";
+      try {
+        if (fb === "summary") text = await generateRecapSummary(ctx, messages);
+        else if (fb === "recap") text = await recapFeedback(ctx, messages);
+        else if (fb === "propernouns") text = await extractProperNouns(ctx, messages);
+        else if (fb === "gap_analysis") text = await analyzeKnowledgeGaps(ctx, messages);
+      } catch {
+        continue;
+      }
+      if (text) {
+        saveFeedback(sid, fb, text);
+        const label =
+          fb === "summary" ? "Summary" :
+          fb === "recap" ? "Recap" :
+          fb === "propernouns" ? "Kata Nama Khas" :
+          fb === "gap_analysis" ? "Analisis Jurang Pembelajaran" :
+          fb;
+        console.log(chalk.dim(`  [${label}]`));
+        console.log(`  ${text}\n`);
+      }
     }
 
     saveQuestionLog(sid, {

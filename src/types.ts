@@ -92,17 +92,11 @@ export interface TopicSummary {
   questionCount: number;
 }
 
-export interface TeacherConfig {
-  displayName: string;
-  prompt: string;
-}
-
 export interface SubjectConfig {
   language: string;
   instructions: string;
   mode: QuizMode;
-  teachers: Record<string, TeacherConfig>;
-  passiveFeedback: string[];
+  feedbacks: string[];
   prompts: {
     generate: string;
   };

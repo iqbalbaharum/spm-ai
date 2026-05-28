@@ -7,10 +7,11 @@ vi.mock("../agents/generator.js", () => ({
 
 vi.mock("../agents/teachers.js", () => ({
   buildActiveRecallPrompt: vi.fn(),
-  passiveFeedback: vi.fn(),
+  recapFeedback: vi.fn(),
   extractProperNouns: vi.fn(),
   generateRecapSummary: vi.fn(),
   evaluateSubjectiveAnswer: vi.fn(),
+  analyzeKnowledgeGaps: vi.fn(),
 }));
 
 vi.mock("../agents/llm.js", () => ({
@@ -25,6 +26,7 @@ vi.mock("../db/neo4j.js", () => ({
 
 vi.mock("../db/sqlite.js", () => ({
   createSession: vi.fn(),
+  checkSession: vi.fn(),
   saveQuestionLog: vi.fn(),
   saveActiveRecallMessage: vi.fn(),
   saveFeedback: vi.fn(),
@@ -42,11 +44,7 @@ vi.mock("../config.js", () => ({
         language: "Bahasa Malaysia",
         instructions: "Test instructions",
         mode: "mcq",
-        teachers: {
-          feynman: { displayName: "Feynman", prompt: "teacher_feynman_active.txt" },
-          strict: { displayName: "Strict", prompt: "teacher_strict_active.txt" },
-        },
-        passiveFeedback: ["recap", "propernouns"],
+        feedbacks: ["summary", "recap", "propernouns", "gap_analysis"],
         prompts: { generate: "generate_quiz.txt" },
       },
     },
@@ -60,15 +58,17 @@ import {
   handleListTools,
   handleGetQuestion,
   handleAnswerLoop,
+  handleRegenerateSession,
   sessions,
 } from "../mcp-server.js";
 
 import { generateQuestion } from "../agents/generator.js";
-import { buildActiveRecallPrompt, passiveFeedback, extractProperNouns, generateRecapSummary } from "../agents/teachers.js";
+import { buildActiveRecallPrompt, recapFeedback, extractProperNouns, generateRecapSummary, analyzeKnowledgeGaps } from "../agents/teachers.js";
 import { callLLMStructured } from "../agents/llm.js";
 import { getParetoTopics, getTopicWithQuestions } from "../db/neo4j.js";
 import {
   createSession,
+  checkSession,
   saveQuestionLog,
   saveActiveRecallMessage,
   saveFeedback,
@@ -115,13 +115,16 @@ describe("MCP Server", () => {
     it("should return both tools with correct names", async () => {
       const result = await handleListTools();
 
-      expect(result.tools).toHaveLength(2);
+      expect(result.tools).toHaveLength(3);
       expect(result.tools[0].name).toBe("get_question");
       expect(result.tools[1].name).toBe("answer_loop");
+      expect(result.tools[2].name).toBe("regenerate_session");
 
       expect(result.tools[0].inputSchema.required).toContain("subject");
       expect(result.tools[1].inputSchema.required).toContain("session_id");
       expect(result.tools[1].inputSchema.required).toContain("answer");
+      expect(result.tools[2].inputSchema.required).toContain("session_id");
+      expect(result.tools[2].inputSchema.required).toContain("user_id");
     });
   });
 
@@ -183,11 +186,7 @@ describe("MCP Server", () => {
           language: "Bahasa Malaysia",
           instructions: "",
           mode: "mcq",
-          teachers: {
-            feynman: { displayName: "Feynman", prompt: "teacher_feynman_active.txt" },
-            strict: { displayName: "Strict", prompt: "teacher_strict_active.txt" },
-          },
-          passiveFeedback: ["recap", "propernouns"],
+          feedbacks: ["summary", "recap", "propernouns", "gap_analysis"],
           prompts: { generate: "generate_quiz.txt" },
         },
         topic: mockTopicSummary,
@@ -232,11 +231,7 @@ describe("MCP Server", () => {
           language: "Bahasa Malaysia",
           instructions: "",
           mode: "mcq",
-          teachers: {
-            feynman: { displayName: "Feynman", prompt: "teacher_feynman_active.txt" },
-            strict: { displayName: "Strict", prompt: "teacher_strict_active.txt" },
-          },
-          passiveFeedback: ["recap", "propernouns"],
+          feedbacks: ["summary", "recap", "propernouns", "gap_analysis"],
           prompts: { generate: "generate_quiz.txt" },
         },
         topic: mockTopicSummary,
@@ -315,13 +310,22 @@ describe("MCP Server", () => {
       state.status = "in-dialogue";
       state.rounds = 2;
 
-      (passiveFeedback as Mock).mockResolvedValue("recap content");
+      (getActiveRecall as Mock).mockReturnValue([
+        { role: "system", content: "prompt" },
+        { role: "user", content: "Begin" },
+        { role: "assistant", content: "First question?" },
+        { role: "user", content: "Malayan Union" },
+        { role: "assistant", content: "Good" },
+        { role: "user", content: "Saya faham." },
+      ]);
+      (recapFeedback as Mock).mockResolvedValue("recap content");
       (extractProperNouns as Mock).mockResolvedValue(
         "• Tunku Abdul Rahman — Ketua Menteri pertama"
       );
       (generateRecapSummary as Mock).mockResolvedValue(
         'The key concept is "Kemerdekaan". Tanah Melayu achieved independence on 31 August 1957.'
       );
+      (analyzeKnowledgeGaps as Mock).mockResolvedValue("");
 
       const second = await handleAnswerLoop({
         session_id: testSessionId,
@@ -339,7 +343,7 @@ describe("MCP Server", () => {
       expect(data.response).toContain("[Kata Nama Khas]");
 
       expect(saveActiveRecallMessage).toHaveBeenCalled();
-      expect(saveFeedback).toHaveBeenCalledTimes(2);
+      expect(saveFeedback).toHaveBeenCalledTimes(3);
       expect(saveQuestionLog).toHaveBeenCalledOnce();
       expect(completeSession).toHaveBeenCalledOnce();
 
@@ -368,9 +372,10 @@ describe("MCP Server", () => {
         message: "Great, you understand!",
         complete: true,
       });
-      (passiveFeedback as Mock).mockResolvedValue("recap content");
+      (recapFeedback as Mock).mockResolvedValue("recap content");
       (extractProperNouns as Mock).mockResolvedValue("");
       (generateRecapSummary as Mock).mockResolvedValue("summary");
+      (analyzeKnowledgeGaps as Mock).mockResolvedValue("");
 
       const second = await handleAnswerLoop({
         session_id: testSessionId,
@@ -382,6 +387,63 @@ describe("MCP Server", () => {
       expect(data.completed).toBe(true);
       expect(data.response).toContain("─── Feedback Summary ───");
       expect(data.response).not.toContain("[Kata Nama Khas]");
+    });
+  });
+
+  describe("handleRegenerateSession", () => {
+    it("should error when session_id is missing", async () => {
+      const result = await handleRegenerateSession({ user_id: "user1" });
+      const { isError, data } = parseToolResponse(result);
+      expect(isError).toBe(true);
+      expect(data.error).toContain("session_id");
+    });
+
+    it("should error when user_id is missing", async () => {
+      const result = await handleRegenerateSession({ session_id: "s1" });
+      const { isError, data } = parseToolResponse(result);
+      expect(isError).toBe(true);
+      expect(data.error).toContain("user_id");
+    });
+
+    it("should error on ownership mismatch", async () => {
+      (checkSession as Mock).mockReturnValue(false);
+      const result = await handleRegenerateSession({ session_id: "s1", user_id: "user1" });
+      const { isError, data } = parseToolResponse(result);
+      expect(isError).toBe(true);
+      expect(data.error).toContain("not found");
+    });
+
+    it("should return completed session data", async () => {
+      (checkSession as Mock).mockReturnValue(true);
+      (getSessionDetail as Mock).mockReturnValue({
+        session: { completed_at: "2026-01-01", summary: '{"total":1}' },
+        questions: [{ question: "Q?", options: '["A","B","C","D"]', correct_answer: "A" }],
+        activeRecall: [],
+        feedbacks: [{ instructor: "summary", text: "Great job" }],
+      });
+
+      const result = await handleRegenerateSession({ session_id: "s1", user_id: "user1" });
+      const { isError, data } = parseToolResponse(result);
+      expect(isError).toBeFalsy();
+      expect(data.completed).toBe(true);
+      expect(data.response).toBe("Great job");
+    });
+
+    it("should return question when session has no dialogue", async () => {
+      (checkSession as Mock).mockReturnValue(true);
+      (getSessionDetail as Mock).mockReturnValue({
+        session: { completed_at: null },
+        questions: [{ question: "Q1?", options: '["A. X","B. Y","C. Z","D. W"]', keyword: "key", topic: "T" }],
+        activeRecall: [],
+        feedbacks: [],
+      });
+
+      const result = await handleRegenerateSession({ session_id: "s1", user_id: "user1" });
+      const { isError, data } = parseToolResponse(result);
+      expect(isError).toBeFalsy();
+      expect(data.status).toBe("question");
+      expect(data.question).toBe("Q1?");
+      expect(data.options).toHaveLength(4);
     });
   });
 });

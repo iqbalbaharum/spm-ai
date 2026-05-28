@@ -3,11 +3,7 @@
     "language": "Bahasa Malaysia",
     "instructions": "IMPORTANT: All responses MUST be in Bahasa Malaysia (formal SPM exam-level Malay). Do NOT use English, do NOT use Indonesian (bahasa Indonesia). Use standard Malay terminology.",
     "mode": "mcq",
-    "teachers": {
-      "feynman": { "displayName": "Feynman", "prompt": "teacher_feynman_active.txt" },
-      "strict": { "displayName": "Strict", "prompt": "teacher_strict_active.txt" }
-    },
-    "passiveFeedback": ["recap", "propernouns"],
+    "feedbacks": ["summary", "recap", "propernouns", "gap_analysis"],
     "prompts": {
       "generate": "generate_quiz.txt"
     }
@@ -16,11 +12,7 @@
     "language": "Bahasa Malaysia",
     "instructions": "IMPORTANT: All responses MUST be in Bahasa Malaysia (formal SPM exam-level Malay). Do NOT use English, do NOT use Indonesian (bahasa Indonesia). Use standard Malay terminology.",
     "mode": "subjective",
-    "teachers": {
-      "feynman": { "displayName": "Feynman", "prompt": "teacher_bm_feynman.txt" },
-      "strict": { "displayName": "Strict", "prompt": "teacher_bm_strict.txt" }
-    },
-    "passiveFeedback": [],
+    "feedbacks": [],
     "prompts": {
       "generate": "generate_bm_soalan.txt"
     }

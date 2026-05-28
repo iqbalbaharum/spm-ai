@@ -14,15 +14,17 @@ import {
 import { generateQuestion } from "./agents/generator.js";
 import {
   buildActiveRecallPrompt,
-  passiveFeedback,
+  recapFeedback,
   extractProperNouns,
   generateRecapSummary,
   evaluateSubjectiveAnswer,
+  analyzeKnowledgeGaps,
 } from "./agents/teachers.js";
-import { callLLMStructured } from "./agents/llm.js";
+import { callActiveRecallWithRetry } from "./agents/active-recall.js";
 import { getParetoTopics, getTopicWithQuestions, closeDb } from "./db/neo4j.js";
 import {
   createSession,
+  checkSession,
   saveQuestionLog,
   saveActiveRecallMessage,
   saveFeedback,
@@ -37,7 +39,6 @@ import type {
   ChatMessage,
   QuizQuestion,
   DialogueContext,
-  ActiveRecallResponse,
   SubjectConfig,
   TopicSummary,
   TopicWithQuestions,
@@ -136,6 +137,82 @@ function reconstructCompletedResponse(sessionId: string): Record<string, unknown
   };
 }
 
+export async function handleRegenerateSession(args: Record<string, unknown>) {
+  const sessionId = args?.session_id as string;
+  const userId = args?.user_id as string;
+
+  if (!sessionId) return asErrorResponse("session_id is required");
+  if (!userId) return asErrorResponse("user_id is required");
+
+  if (!checkSession(sessionId, userId)) {
+    return asErrorResponse("Session not found or does not belong to this user");
+  }
+
+  const detail = getSessionDetail(sessionId);
+  if (!detail) return asErrorResponse("Session not found");
+
+  // Case 1: Session completed → redisplay summary
+  if (detail.session.completed_at) {
+    const completed = reconstructCompletedResponse(sessionId);
+    if (completed) return asToolResponse(completed);
+    return asToolResponse({
+      completed: true,
+      response: "(completed)",
+      feedbacks: detail.feedbacks,
+      summary: detail.session.summary,
+    });
+  }
+
+  // Case 2: Has active recall
+  if (detail.activeRecall.length > 0) {
+    const messages: ChatMessage[] = detail.activeRecall.map((m) => ({
+      role: m.role as "system" | "user" | "assistant",
+      content: m.content as string,
+    }));
+
+    const lastMsg = detail.activeRecall[detail.activeRecall.length - 1];
+
+    if (lastMsg.role === "assistant") {
+      const rounds = detail.activeRecall.filter((m) => m.role === "assistant").length;
+      return asToolResponse({
+        status: "dialogue",
+        session_id: sessionId,
+        response: lastMsg.content,
+        round: rounds,
+      });
+    }
+
+    // Last message is user (eval failed) → regenerate
+    const result = await callActiveRecallWithRetry(messages, { sessionId });
+    saveActiveRecallMessage(sessionId, "assistant", result.message);
+
+    const rounds = detail.activeRecall.filter((m) => m.role === "assistant").length + 1;
+    return asToolResponse({
+      status: "regenerated",
+      session_id: sessionId,
+      response: result.message,
+      round: rounds,
+    });
+  }
+
+  // Case 3: Has question but no dialogue → display question
+  if (detail.questions.length > 0) {
+    const q = detail.questions[0] as Record<string, unknown>;
+    const options = q.options ? JSON.parse(q.options as string) : undefined;
+    return asToolResponse({
+      status: "question",
+      session_id: sessionId,
+      question: q.question as string,
+      options,
+      keyword: q.keyword as string,
+      topic: q.topic as string,
+      mode: options ? "mcq" : "subjective",
+    });
+  }
+
+  return asErrorResponse("Session has no data to regenerate");
+}
+
 // --- Tool handlers ---
 
 export async function handleListTools() {
@@ -180,6 +257,25 @@ export async function handleListTools() {
           required: ["session_id", "answer"],
         },
       },
+      {
+        name: "regenerate_session",
+        description:
+          "Redisplay or regenerate a session's last interaction. Returns the question (if no answer submitted), last dialogue response, or completed summary. Regenerates (re-calls LLM) only when the last active recall message has no assistant response. Ownership check via user_id.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            session_id: {
+              type: "string",
+              description: "Session ID to regenerate",
+            },
+            user_id: {
+              type: "string",
+              description: "User identifier for ownership validation",
+            },
+          },
+          required: ["session_id", "user_id"],
+        },
+      },
     ],
   };
 }
@@ -198,8 +294,7 @@ export async function handleGetQuestion(args: Record<string, unknown>) {
       language: "Bahasa Malaysia",
       instructions: "",
       mode: "mcq",
-      teachers: {},
-      passiveFeedback: [],
+      feedbacks: [],
       prompts: { generate: "generate_quiz.txt" },
     };
 
@@ -227,7 +322,7 @@ export async function handleGetQuestion(args: Record<string, unknown>) {
     usedQuestions,
   });
 
-  createSession(sid, subject);
+  createSession(sid, subject, userId);
 
   const state: SessionState = {
     sessionId: sid,
@@ -309,7 +404,7 @@ export async function handleAnswerLoop(args: Record<string, unknown>) {
       { role: "user", content: initialUserMsg },
     ];
 
-    const result = await callLLMStructured<ActiveRecallResponse>(messages, {
+    const result = await callActiveRecallWithRetry(messages, {
       sessionId: state.sessionId,
     });
 
@@ -342,7 +437,7 @@ export async function handleAnswerLoop(args: Record<string, unknown>) {
       content: m.content,
     }));
 
-    const result = await callLLMStructured<ActiveRecallResponse>(messages, {
+    const result = await callActiveRecallWithRetry(messages, {
       sessionId: state.sessionId,
     });
 
@@ -374,32 +469,25 @@ async function completeSessionAndGetResult(
     correct = 1;
   }
 
-  // Passive feedback
-  let recap = "";
-  if (subjectConfig.passiveFeedback.includes("recap")) {
+  // Unified feedback loop
+  const recall = getActiveRecall(state.sessionId);
+  const feedbacks: { instructor: string; text: string }[] = [];
+
+  for (const fb of subjectConfig.feedbacks) {
+    let text = "";
     try {
-      recap = await passiveFeedback("recap", ctx);
+      if (fb === "summary") text = await generateRecapSummary(ctx, recall);
+      else if (fb === "recap") text = await recapFeedback(ctx, recall);
+      else if (fb === "propernouns") text = await extractProperNouns(ctx, recall);
+      else if (fb === "gap_analysis") text = await analyzeKnowledgeGaps(ctx, recall);
     } catch {
-      recap = "(feedback unavailable)";
+      continue;
+    }
+    if (text) {
+      saveFeedback(state.sessionId, fb, text);
+      feedbacks.push({ instructor: fb, text });
     }
   }
-
-  let propernouns = "";
-  if (subjectConfig.passiveFeedback.includes("propernouns")) {
-    try {
-      propernouns = await extractProperNouns(ctx);
-    } catch {
-      propernouns = "";
-    }
-  }
-
-  // Summary
-  const summaryText = await generateRecapSummary(ctx);
-
-  // Save feedback
-  saveFeedback(state.sessionId, "summary", summaryText);
-  if (recap) saveFeedback(state.sessionId, "recap", recap);
-  if (propernouns) saveFeedback(state.sessionId, "propernouns", propernouns);
 
   // Save question log
   saveQuestionLog(state.sessionId, {
@@ -413,14 +501,9 @@ async function completeSessionAndGetResult(
 
   state.status = "complete";
 
-  const feedbacks: { instructor: string; text: string }[] = [];
-  feedbacks.push({ instructor: "summary", text: summaryText });
-  if (recap) feedbacks.push({ instructor: "recap", text: recap });
-  if (propernouns) feedbacks.push({ instructor: "propernouns", text: propernouns });
-
   return {
     completed: true,
-    response: summaryText,
+    response: feedbacks.find((f) => f.instructor === "summary")?.text || "(completed)",
     mode: subjectConfig.mode,
     feedbacks,
     summary: { total: 1, answered: 1, correct },
@@ -444,6 +527,8 @@ async function main() {
             return await handleGetQuestion(args ?? {});
           case "answer_loop":
             return await handleAnswerLoop(args ?? {});
+          case "regenerate_session":
+            return await handleRegenerateSession(args ?? {});
           default:
             throw new McpError(
               ErrorCode.MethodNotFound,

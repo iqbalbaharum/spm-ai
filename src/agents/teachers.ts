@@ -34,6 +34,20 @@ function getKeyword(ctx: DialogueContext): string {
   return "keyword" in ctx.question ? ctx.question.keyword : "";
 }
 
+function buildMessagesWithConversation(
+  systemPrompt: string,
+  conversation: { role: string; content: string }[],
+  userMessage: string
+): ChatMessage[] {
+  return [
+    { role: "system", content: systemPrompt },
+    ...conversation
+      .filter((m) => m.role !== "system")
+      .map((m) => ({ role: m.role as ChatMessage["role"], content: m.content })),
+    { role: "user", content: userMessage },
+  ];
+}
+
 export function buildActiveRecallPrompt(ctx: DialogueContext): string {
   const template = loadPrompt("teacher_active_recall.txt");
   const q = ctx.question;
@@ -59,96 +73,90 @@ export function buildActiveRecallPrompt(ctx: DialogueContext): string {
   return result;
 }
 
-export async function passiveFeedback(
-  teacher: "recap" | "kbat",
-  ctx: DialogueContext
+export async function recapFeedback(
+  ctx: DialogueContext,
+  conversation: { role: string; content: string }[]
 ): Promise<string> {
-  const promptName = teacher === "recap" ? "teacher_recap_passive.txt" : "teacher_kbat_passive.txt";
-  const template = loadPrompt(promptName);
+  const template = loadPrompt("teacher_recap_passive.txt");
 
-  const q = ctx.question;
-  const isCorrect = isMcq(q) && q.correctAnswer?.toUpperCase() === ctx.studentAnswer?.toUpperCase();
-
-  let result = template
+  const systemPrompt = template
     .replace("{subjectInstructions}", ctx.subjectInstructions)
     .replace("{topic}", ctx.topic)
     .replace("{keyword}", getKeyword(ctx))
-    .replace("{studentAnswer}", ctx.studentAnswer)
-    .replace("{isCorrect}", isCorrect ? "benar" : "tidak tepat")
-    .replace("{topicText}", cleanTopicText(ctx.topicText))
-    .replace(
-      "{examQuestions}",
-      ctx.examQuestions.map((x) => `- ${stripExamWrappers(x)}`).join("\n") || "(none available)"
-    );
+    .replace("{topicText}", cleanTopicText(ctx.topicText));
 
-  if (isMcq(q)) {
-    result = result
-      .replace("{correctAnswer}", q.correctAnswer)
-      .replace("{explanation}", q.explanation);
-  }
+  const messages = buildMessagesWithConversation(systemPrompt, conversation, "Provide feedback.");
 
-  const response = await callLLM(
-    [
-      { role: "system", content: result },
-      { role: "user", content: "Provide feedback." },
-    ],
-    { sessionId: ctx.sessionId }
-  );
-
+  const response = await callLLM(messages, { sessionId: ctx.sessionId });
   return response.content;
 }
 
-interface ProperNounsItem {
-  term: string;
-  description: string;
-}
-
 export async function extractProperNouns(
-  ctx: DialogueContext
+  ctx: DialogueContext,
+  conversation: { role: string; content: string }[]
 ): Promise<string> {
   const template = loadPrompt("teacher_propernouns_passive.txt");
 
-  const filled = template
+  const systemPrompt = template
     .replace("{subjectInstructions}", ctx.subjectInstructions)
+    .replace("{topic}", ctx.topic)
+    .replace("{question}", ctx.question.question)
+    .replace("{correctAnswer}", isMcq(ctx.question) ? ctx.question.correctAnswer : "N/A")
+    .replace("{keyword}", getKeyword(ctx))
     .replace("{topicText}", cleanTopicText(ctx.topicText));
 
+  const messages = buildMessagesWithConversation(systemPrompt, conversation, "Evaluate the student's use of proper nouns.");
+
   try {
-    const result = await callLLMStructured<{ items: ProperNounsItem[] }>(
-      [
-        { role: "system", content: filled },
-        { role: "user", content: "Extract proper nouns." },
-      ],
-      { sessionId: ctx.sessionId }
-    );
-
-    const validItems = (result.items || []).filter(
-      (item) =>
-        item &&
-        typeof item.term === "string" &&
-        item.term.trim().length > 0 &&
-        typeof item.description === "string" &&
-        item.description.trim().length > 0 &&
-        item.description.trim() !== "undefined"
-    );
-
-    if (validItems.length === 0) return "";
-
-    return validItems
-      .map((item) => `• ${item.term.trim()} — ${item.description.trim()}`)
-      .join("\n");
+    const response = await callLLM(messages, { sessionId: ctx.sessionId });
+    return response.content;
   } catch {
     return "";
   }
 }
 
 export async function generateRecapSummary(
-  ctx: DialogueContext
+  ctx: DialogueContext,
+  conversation: { role: string; content: string }[]
 ): Promise<string> {
-  const q = ctx.question;
-  if (isMcq(q)) {
-    return `Konsep utama ialah "${q.keyword}". ${q.explanation}`;
+  const template = loadPrompt("teacher_summary_passive.txt");
+
+  const systemPrompt = template
+    .replace("{subjectInstructions}", ctx.subjectInstructions)
+    .replace("{topic}", ctx.topic)
+    .replace("{question}", ctx.question.question)
+    .replace("{correctAnswer}", isMcq(ctx.question) ? ctx.question.correctAnswer : "N/A")
+    .replace("{keyword}", getKeyword(ctx))
+    .replace("{topicText}", cleanTopicText(ctx.topicText));
+
+  const messages = buildMessagesWithConversation(systemPrompt, conversation, "Summarize the student's performance.");
+
+  const response = await callLLM(messages, { sessionId: ctx.sessionId });
+  return response.content;
+}
+
+export async function analyzeKnowledgeGaps(
+  ctx: DialogueContext,
+  conversation: { role: string; content: string }[]
+): Promise<string> {
+  const template = loadPrompt("teacher_gap_analysis.txt");
+
+  const systemPrompt = template
+    .replace("{subjectInstructions}", ctx.subjectInstructions)
+    .replace("{topic}", ctx.topic)
+    .replace("{question}", ctx.question.question)
+    .replace("{correctAnswer}", isMcq(ctx.question) ? ctx.question.correctAnswer : "N/A")
+    .replace("{keyword}", getKeyword(ctx))
+    .replace("{topicText}", cleanTopicText(ctx.topicText));
+
+  const messages = buildMessagesWithConversation(systemPrompt, conversation, "Analyze the student's knowledge gaps.");
+
+  try {
+    const response = await callLLM(messages, { sessionId: ctx.sessionId });
+    return response.content;
+  } catch {
+    return "";
   }
-  return "Session completed.";
 }
 
 export async function evaluateSubjectiveAnswer(
