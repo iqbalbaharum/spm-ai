@@ -159,6 +159,49 @@ export async function analyzeKnowledgeGaps(
   }
 }
 
+export async function evaluateScore(
+  ctx: DialogueContext,
+  feedbacks: { instructor: string; text: string }[],
+): Promise<number> {
+  const template = loadPrompt("teacher_score_evaluation.txt");
+  const validScores = [0, 0.25, 0.5, 0.75, 1.0];
+
+  const feedbackText = feedbacks
+    .filter((f) => f.instructor !== "summary")
+    .map((f) => `[${f.instructor}]\n${f.text}`)
+    .join("\n\n");
+
+  const systemPrompt = template
+    .replace("{subjectInstructions}", ctx.subjectInstructions)
+    .replace("{feedbacks}", feedbackText || "(none available)");
+
+  const messages: ChatMessage[] = [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: "Score this student." },
+  ];
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const response = await callLLM(messages, { sessionId: ctx.sessionId });
+      const content = response.content.trim();
+
+      const match = content.match(/\{"score":\s*([\d.]+)\}/);
+      if (!match) throw new Error("No score JSON found");
+
+      const score = parseFloat(match[1]);
+      if (validScores.includes(score)) return score;
+    } catch {
+      if (attempt === 3) break;
+      messages.push(
+        { role: "assistant", content: "[INVALID]" },
+        { role: "user", content: "FAILED: Must include {\"score\": <0.0|0.25|0.50|0.75|1.0>} in your response." },
+      );
+    }
+  }
+
+  return 0;
+}
+
 export async function evaluateSubjectiveAnswer(
   ctx: DialogueContext
 ): Promise<{ score: number; maxScore: number; feedback: string }> {

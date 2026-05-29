@@ -12,6 +12,7 @@ vi.mock("../agents/teachers.js", () => ({
   generateRecapSummary: vi.fn(),
   evaluateSubjectiveAnswer: vi.fn(),
   analyzeKnowledgeGaps: vi.fn(),
+  evaluateScore: vi.fn(),
 }));
 
 vi.mock("../agents/llm.js", () => ({
@@ -35,6 +36,11 @@ vi.mock("../db/sqlite.js", () => ({
   getActiveRecall: vi.fn(),
   getFeedbacks: vi.fn(),
   getSessionDetail: vi.fn(),
+  saveMasteryLog: vi.fn(),
+  getScoreHistory: vi.fn(),
+  updateSessionStatus: vi.fn(),
+  updateSessionRounds: vi.fn(),
+  updateStudentAnswer: vi.fn(),
 }));
 
 vi.mock("../config.js", () => ({
@@ -59,11 +65,10 @@ import {
   handleGetQuestion,
   handleAnswerLoop,
   handleRegenerateSession,
-  sessions,
 } from "../mcp-server.js";
 
 import { generateQuestion } from "../agents/generator.js";
-import { buildActiveRecallPrompt, recapFeedback, extractProperNouns, generateRecapSummary, analyzeKnowledgeGaps } from "../agents/teachers.js";
+import { buildActiveRecallPrompt, recapFeedback, extractProperNouns, generateRecapSummary, analyzeKnowledgeGaps, evaluateScore } from "../agents/teachers.js";
 import { callLLMStructured } from "../agents/llm.js";
 import { getParetoTopics, getTopicWithQuestions } from "../db/neo4j.js";
 import {
@@ -77,6 +82,11 @@ import {
   getActiveRecall,
   getFeedbacks,
   getSessionDetail,
+  saveMasteryLog,
+  getScoreHistory,
+  updateSessionStatus,
+  updateSessionRounds,
+  updateStudentAnswer,
 } from "../db/sqlite.js";
 
 const mockTopicSummary = {
@@ -108,7 +118,6 @@ function parseToolResponse(result: { content: Array<{ type: string; text: string
 describe("MCP Server", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    sessions.clear();
   });
 
   describe("handleListTools", () => {
@@ -147,11 +156,11 @@ describe("MCP Server", () => {
       expect(data.topic).toBe(mockTopicSummary.name);
       expect(data.mode).toBe("mcq");
 
-      expect(sessions.size).toBe(1);
-      expect(sessions.get(data.session_id)!.subject).toBe("sejarah");
-      expect(sessions.get(data.session_id)!.status).toBe("awaiting-answer");
-
-      expect(createSession).toHaveBeenCalledOnce();
+      expect(createSession).toHaveBeenCalledWith(data.session_id, "sejarah", "cli");
+      expect(saveQuestionLog).toHaveBeenCalledWith(
+        data.session_id,
+        expect.objectContaining({ seq: 1, topic: mockTopicSummary.name, studentAnswer: null })
+      );
       expect(generateQuestion).toHaveBeenCalledOnce();
       expect(getUsedQuestions).toHaveBeenCalledOnce();
     });
@@ -178,26 +187,32 @@ describe("MCP Server", () => {
   describe("handleAnswerLoop", () => {
     const testSessionId = "2026-05-22-mcp-test";
 
-    beforeEach(() => {
-      sessions.set(testSessionId, {
-        sessionId: testSessionId,
-        subject: "sejarah",
-        subjectConfig: {
-          language: "Bahasa Malaysia",
-          instructions: "",
-          mode: "mcq",
-          feedbacks: ["summary", "recap", "propernouns", "gap_analysis"],
-          prompts: { generate: "generate_quiz.txt" },
+    const mockSessionDetail = (overrides: Record<string, unknown> = {}) => {
+      const qOverrides = (overrides.questions as Record<string, unknown>[] | undefined)?.[0] || {};
+      return {
+        session: {
+          id: testSessionId,
+          user_id: "cli",
+          subject: "sejarah",
+          status: "awaiting-answer",
+          rounds: 0,
+          completed_at: null,
+          summary: "{}",
+          ...(overrides.session as Record<string, unknown> || {}),
         },
-        topic: mockTopicSummary,
-        topicData: mockTopicWithQuestions,
-        question: mockMCQ,
-        studentAnswer: "",
-        status: "awaiting-answer",
-        rounds: 0,
-        systemPrompt: "",
-      });
-    });
+        questions: [{
+          question: mockMCQ.question,
+          options: JSON.stringify(mockMCQ.options),
+          correct_answer: mockMCQ.correctAnswer,
+          keyword: mockMCQ.keyword,
+          topic: mockTopicSummary.name,
+          student_answer: null as string | null,
+          ...qOverrides,
+        }],
+        activeRecall: (overrides.activeRecall as Record<string, unknown>[]) || [],
+        feedbacks: (overrides.feedbacks as Record<string, unknown>[]) || [],
+      };
+    };
 
     it("should error when session_id is missing", async () => {
       const result = await handleAnswerLoop({ answer: "A" });
@@ -216,6 +231,8 @@ describe("MCP Server", () => {
     });
 
     it("should error on unknown session", async () => {
+      (getSessionDetail as Mock).mockReturnValue(null);
+
       const result = await handleAnswerLoop({ session_id: "nonexistent", answer: "A" });
       const { isError, data } = parseToolResponse(result);
 
@@ -224,26 +241,8 @@ describe("MCP Server", () => {
     });
 
     it("should return final response for already completed session", async () => {
-      sessions.set("completed-session", {
-        sessionId: "completed-session",
-        subject: "sejarah",
-        subjectConfig: {
-          language: "Bahasa Malaysia",
-          instructions: "",
-          mode: "mcq",
-          feedbacks: ["summary", "recap", "propernouns", "gap_analysis"],
-          prompts: { generate: "generate_quiz.txt" },
-        },
-        topic: mockTopicSummary,
-        topicData: mockTopicWithQuestions,
-        question: mockMCQ,
-        studentAnswer: "A",
-        status: "complete",
-        rounds: 0,
-        systemPrompt: "",
-      });
       (getSessionDetail as Mock).mockReturnValue({
-        session: { summary: '{"total":1}' },
+        session: { id: "completed-session", status: "complete", completed_at: "2026-01-01", summary: '{"total":1}' },
         questions: [{
           question: mockMCQ.question,
           options: JSON.stringify(mockMCQ.options),
@@ -271,6 +270,8 @@ describe("MCP Server", () => {
     });
 
     it("should start active recall on first answer", async () => {
+      (getSessionDetail as Mock).mockReturnValue(mockSessionDetail());
+      (getTopicWithQuestions as Mock).mockResolvedValue(mockTopicWithQuestions);
       (buildActiveRecallPrompt as Mock).mockReturnValue("active recall system prompt");
       (callLLMStructured as Mock).mockResolvedValue({
         message: "Tell me about Kemerdekaan.",
@@ -285,15 +286,16 @@ describe("MCP Server", () => {
       expect(data.response).toBe("Tell me about Kemerdekaan.");
       expect(data.round).toBe(0);
 
+      expect(updateStudentAnswer).toHaveBeenCalledWith(testSessionId, "B");
       expect(buildActiveRecallPrompt).toHaveBeenCalledOnce();
       expect(saveActiveRecallMessage).toHaveBeenCalledTimes(3); // system, user, assistant
-
-      const state = sessions.get(testSessionId)!;
-      expect(state.status).toBe("in-dialogue");
-      expect(state.studentAnswer).toBe("B");
+      expect(updateSessionStatus).toHaveBeenCalledWith(testSessionId, "in-dialogue");
     });
 
     it("should complete session after max active recall rounds", async () => {
+      // --- First call: submit answer, start active recall ---
+      (getSessionDetail as Mock).mockReturnValueOnce(mockSessionDetail());
+      (getTopicWithQuestions as Mock).mockResolvedValue(mockTopicWithQuestions);
       (buildActiveRecallPrompt as Mock).mockReturnValue("active recall system prompt");
       (callLLMStructured as Mock).mockResolvedValueOnce({
         message: "First question?",
@@ -305,11 +307,16 @@ describe("MCP Server", () => {
       expect(firstData.completed).toBe(false);
       expect(firstData.response).toBe("First question?");
 
-      // Set state to in-dialogue with 2 rounds already done
-      const state = sessions.get(testSessionId)!;
-      state.status = "in-dialogue";
-      state.rounds = 2;
-
+      // --- Second call: in-dialogue, already 2 rounds deep (max is 3) ---
+      (getSessionDetail as Mock).mockReturnValueOnce(mockSessionDetail({
+        session: { status: "in-dialogue", rounds: 2 },
+        questions: [{ student_answer: "B" }],
+      }));
+      (getSessionDetail as Mock).mockReturnValueOnce(mockSessionDetail({
+        session: { status: "in-dialogue", rounds: 2 },
+        questions: [{ student_answer: "B" }],
+      }));
+      (getTopicWithQuestions as Mock).mockResolvedValue(mockTopicWithQuestions);
       (getActiveRecall as Mock).mockReturnValue([
         { role: "system", content: "prompt" },
         { role: "user", content: "Begin" },
@@ -326,6 +333,8 @@ describe("MCP Server", () => {
         'The key concept is "Kemerdekaan". Tanah Melayu achieved independence on 31 August 1957.'
       );
       (analyzeKnowledgeGaps as Mock).mockResolvedValue("");
+      (evaluateScore as Mock).mockResolvedValue(0.75);
+      (getScoreHistory as Mock).mockReturnValue([]);
 
       const second = await handleAnswerLoop({
         session_id: testSessionId,
@@ -338,19 +347,17 @@ describe("MCP Server", () => {
       expect(data.feedbacks).toBeDefined();
       expect(data.summary).toBeDefined();
       expect(data.mode).toBe("mcq");
-      expect(data.response).toContain("─── Feedback Summary ───");
-      expect(data.response).toContain("[Recap]");
-      expect(data.response).toContain("[Kata Nama Khas]");
 
       expect(saveActiveRecallMessage).toHaveBeenCalled();
-      expect(saveFeedback).toHaveBeenCalledTimes(3);
-      expect(saveQuestionLog).toHaveBeenCalledOnce();
+      expect(saveFeedback).toHaveBeenCalled();
       expect(completeSession).toHaveBeenCalledOnce();
-
-      expect(sessions.get(testSessionId)!.status).toBe("complete");
+      expect(updateSessionStatus).toHaveBeenCalledWith(testSessionId, "complete");
     });
 
     it("should complete when LLM signals complete before max rounds", async () => {
+      // --- First call: submit answer, start active recall ---
+      (getSessionDetail as Mock).mockReturnValueOnce(mockSessionDetail());
+      (getTopicWithQuestions as Mock).mockResolvedValue(mockTopicWithQuestions);
       (buildActiveRecallPrompt as Mock).mockReturnValue("active recall system prompt");
       (callLLMStructured as Mock).mockResolvedValueOnce({
         message: "First question?",
@@ -361,7 +368,16 @@ describe("MCP Server", () => {
       const { data: firstData } = parseToolResponse(first);
       expect(firstData.completed).toBe(false);
 
-      // Second round — LLM signals complete
+      // --- Second call: LLM signals complete ---
+      (getSessionDetail as Mock).mockReturnValueOnce(mockSessionDetail({
+        session: { status: "in-dialogue", rounds: 1 },
+        questions: [{ student_answer: "B" }],
+      }));
+      (getSessionDetail as Mock).mockReturnValueOnce(mockSessionDetail({
+        session: { status: "in-dialogue", rounds: 1 },
+        questions: [{ student_answer: "B" }],
+      }));
+      (getTopicWithQuestions as Mock).mockResolvedValue(mockTopicWithQuestions);
       (getActiveRecall as Mock).mockReturnValue([
         { role: "system", content: "prompt" },
         { role: "user", content: "Begin" },
@@ -376,6 +392,8 @@ describe("MCP Server", () => {
       (extractProperNouns as Mock).mockResolvedValue("");
       (generateRecapSummary as Mock).mockResolvedValue("summary");
       (analyzeKnowledgeGaps as Mock).mockResolvedValue("");
+      (evaluateScore as Mock).mockResolvedValue(0.75);
+      (getScoreHistory as Mock).mockReturnValue([]);
 
       const second = await handleAnswerLoop({
         session_id: testSessionId,
@@ -385,8 +403,7 @@ describe("MCP Server", () => {
 
       expect(isError).toBeFalsy();
       expect(data.completed).toBe(true);
-      expect(data.response).toContain("─── Feedback Summary ───");
-      expect(data.response).not.toContain("[Kata Nama Khas]");
+      expect(data.response).toBe("summary");
     });
   });
 

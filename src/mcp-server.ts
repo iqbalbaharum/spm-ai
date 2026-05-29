@@ -19,6 +19,7 @@ import {
   generateRecapSummary,
   evaluateSubjectiveAnswer,
   analyzeKnowledgeGaps,
+  evaluateScore,
 } from "./agents/teachers.js";
 import { callActiveRecallWithRetry } from "./agents/active-recall.js";
 import { getParetoTopics, getTopicWithQuestions, closeDb } from "./db/neo4j.js";
@@ -33,6 +34,11 @@ import {
   getActiveRecall,
   getFeedbacks,
   getSessionDetail,
+  saveMasteryLog,
+  getScoreHistory,
+  updateSessionStatus,
+  updateSessionRounds,
+  updateStudentAnswer,
 } from "./db/sqlite.js";
 import { config } from "./config.js";
 import type {
@@ -40,8 +46,6 @@ import type {
   QuizQuestion,
   DialogueContext,
   SubjectConfig,
-  TopicSummary,
-  TopicWithQuestions,
 } from "./types.js";
 import { isMcq } from "./types.js";
 
@@ -67,30 +71,20 @@ function shuffle<T>(arr: T[]): T[] {
   return a;
 }
 
-interface SessionState {
-  sessionId: string;
-  subject: string;
-  subjectConfig: SubjectConfig;
-  topic: TopicSummary;
-  topicData: TopicWithQuestions;
-  question: QuizQuestion;
-  studentAnswer: string;
-  status: "awaiting-answer" | "in-dialogue" | "complete";
-  rounds: number;
-  systemPrompt: string;
-}
-
-const sessions = new Map<string, SessionState>();
-
-function buildDialogueContext(state: SessionState): DialogueContext {
+function parseQuestionFromLog(q: Record<string, unknown>): QuizQuestion {
+  if (q.options) {
+    return {
+      question: q.question as string,
+      options: JSON.parse(q.options as string) as [string, string, string, string],
+      correctAnswer: q.correct_answer as "A" | "B" | "C" | "D",
+      explanation: "",
+      keyword: (q.keyword as string) || "",
+    };
+  }
   return {
-    question: state.question,
-    studentAnswer: state.studentAnswer,
-    topic: state.topic.name,
-    topicText: state.topicData.text,
-    examQuestions: state.topicData.examQuestions,
-    subjectInstructions: state.subjectConfig.instructions,
-    sessionId: state.sessionId,
+    question: q.question as string,
+    markingScheme: "",
+    keyword: (q.keyword as string) || "",
   };
 }
 
@@ -324,19 +318,13 @@ export async function handleGetQuestion(args: Record<string, unknown>) {
 
   createSession(sid, subject, userId);
 
-  const state: SessionState = {
-    sessionId: sid,
-    subject,
-    subjectConfig,
-    topic: selectedTopic,
-    topicData,
+  // Save question log immediately so data survives server restart
+  saveQuestionLog(sid, {
+    seq: 1,
+    topic: selectedTopic.name,
     question,
-    studentAnswer: "",
-    status: "awaiting-answer",
-    rounds: 0,
-    systemPrompt: "",
-  };
-  sessions.set(sid, state);
+    studentAnswer: null,
+  });
 
   if (isMcq(question)) {
     return asToolResponse({
@@ -366,52 +354,76 @@ export async function handleAnswerLoop(args: Record<string, unknown>) {
   if (!sessionIdArg) return asErrorResponse("session_id is required");
   if (!answer) return asErrorResponse("answer is required");
 
-  const state = sessions.get(sessionIdArg);
-  if (!state) {
-    // Check if session exists in DB (completed/completed session replay)
+  // Read session from DB instead of in-memory Map
+  const detail = getSessionDetail(sessionIdArg);
+  if (!detail) {
+    // Check for completed session (replay via reconstructCompletedResponse)
     const existing = reconstructCompletedResponse(sessionIdArg);
     if (existing) return asToolResponse(existing);
-    return asErrorResponse(
-      `Session "${sessionIdArg}" not found.`
-    );
+    return asErrorResponse(`Session "${sessionIdArg}" not found.`);
   }
-  if (state.status === "complete") {
-    const result = reconstructCompletedResponse(sessionIdArg);
-    if (result) return asToolResponse(result);
-    return asErrorResponse(
-      `Session "${sessionIdArg}" is already complete.`
-    );
+
+  if (detail.session.completed_at || detail.session.status === "complete") {
+    const existing = reconstructCompletedResponse(sessionIdArg);
+    if (existing) return asToolResponse(existing);
+    return asErrorResponse(`Session "${sessionIdArg}" is already complete.`);
   }
+
+  const q = detail.questions[0];
+  if (!q) return asErrorResponse("Session has no question data.");
+
+  const status = (detail.session.status as string) || "awaiting-answer";
+  let rounds = (detail.session.rounds as number) || 0;
+  const userId = (detail.session.user_id as string) || "cli";
+  const subject = (detail.session.subject as string) || "";
+  const subjectConfig: SubjectConfig =
+    config.subjectConfigs[subject.toLowerCase()] ||
+    config.subjectConfigs["sejarah"] || {
+      language: "Bahasa Malaysia",
+      instructions: "",
+      mode: "mcq",
+      feedbacks: [],
+      prompts: { generate: "generate_quiz.txt" },
+    };
 
   // --- First call: user submits answer ---
-  if (state.status === "awaiting-answer") {
-    state.studentAnswer = answer;
-    const ctx = buildDialogueContext(state);
+  if (status === "awaiting-answer") {
+    updateStudentAnswer(sessionIdArg, answer);
 
-    // Build active recall system prompt
-    state.systemPrompt = buildActiveRecallPrompt(ctx);
-    saveActiveRecallMessage(state.sessionId, "system", state.systemPrompt);
+    // Re-fetch topic data from Neo4j for prompt building
+    const topicName = q.topic as string;
+    const topicData = await getTopicWithQuestions(topicName);
 
-    // Initial user message to kick off active recall
-    const initialUserMsg = isMcq(state.question)
+    const ctx: DialogueContext = {
+      question: parseQuestionFromLog(q),
+      studentAnswer: answer,
+      topic: topicName,
+      topicText: topicData.text,
+      examQuestions: topicData.examQuestions,
+      subjectInstructions: subjectConfig.instructions,
+      sessionId: sessionIdArg,
+    };
+
+    const systemPrompt = buildActiveRecallPrompt(ctx);
+    saveActiveRecallMessage(sessionIdArg, "system", systemPrompt);
+
+    const initialUserMsg = q.options
       ? `The student answered "${answer}". Begin the active recall session.`
       : `The student submitted their essay. Begin the active recall session.`;
 
-    saveActiveRecallMessage(state.sessionId, "user", initialUserMsg);
+    saveActiveRecallMessage(sessionIdArg, "user", initialUserMsg);
 
     const messages: ChatMessage[] = [
-      { role: "system", content: state.systemPrompt },
+      { role: "system", content: systemPrompt },
       { role: "user", content: initialUserMsg },
     ];
 
     const result = await callActiveRecallWithRetry(messages, {
-      sessionId: state.sessionId,
+      sessionId: sessionIdArg,
     });
 
-    saveActiveRecallMessage(state.sessionId, "assistant", result.message);
-
-    state.status = "in-dialogue";
-    state.rounds = 0;
+    saveActiveRecallMessage(sessionIdArg, "assistant", result.message);
+    updateSessionStatus(sessionIdArg, "in-dialogue");
 
     return asToolResponse({
       completed: result.complete,
@@ -421,56 +433,90 @@ export async function handleAnswerLoop(args: Record<string, unknown>) {
   }
 
   // --- Subsequent calls: dialogue rounds ---
-  if (state.status === "in-dialogue") {
-    state.rounds++;
+  if (status === "in-dialogue") {
+    rounds++;
+    updateSessionRounds(sessionIdArg, rounds);
 
-    saveActiveRecallMessage(state.sessionId, "user", answer);
+    saveActiveRecallMessage(sessionIdArg, "user", answer);
 
-    if (state.rounds >= MAX_ACTIVE_RECALL_ROUNDS) {
-      return asToolResponse(await completeSessionAndGetResult(state));
+    if (rounds >= MAX_ACTIVE_RECALL_ROUNDS) {
+      return asToolResponse(await completeSessionAndGetResult(sessionIdArg, userId));
     }
 
     // Build messages from saved active recall
-    const recall = getActiveRecall(state.sessionId);
+    const recall = getActiveRecall(sessionIdArg);
     const messages: ChatMessage[] = recall.map((m) => ({
       role: m.role as "system" | "user" | "assistant",
       content: m.content,
     }));
 
     const result = await callActiveRecallWithRetry(messages, {
-      sessionId: state.sessionId,
+      sessionId: sessionIdArg,
     });
 
-    saveActiveRecallMessage(state.sessionId, "assistant", result.message);
+    saveActiveRecallMessage(sessionIdArg, "assistant", result.message);
 
     if (result.complete) {
-      return asToolResponse(await completeSessionAndGetResult(state));
+      return asToolResponse(await completeSessionAndGetResult(sessionIdArg, userId));
     }
 
     return asToolResponse({
       completed: false,
       response: result.message,
-      round: state.rounds,
+      round: rounds,
     });
   }
 
-  return asErrorResponse(`Unexpected session status: ${state.status}`);
+  return asErrorResponse(`Unexpected session status: ${status}`);
 }
 
 async function completeSessionAndGetResult(
-  state: SessionState
+  sessionId: string,
+  userId: string
 ): Promise<Record<string, unknown>> {
-  const ctx = buildDialogueContext(state);
-  const subjectConfig = state.subjectConfig;
+  const detail = getSessionDetail(sessionId);
+  if (!detail || !detail.questions[0]) {
+    return { completed: true, response: "(completed)", feedbacks: [], summary: {} };
+  }
+
+  const q = detail.questions[0];
+  const studentAnswer = (q.student_answer as string) || "";
+  const topicName = q.topic as string;
+  const subject = (detail.session.subject as string) || "";
+
+  const subjectConfig: SubjectConfig =
+    config.subjectConfigs[subject.toLowerCase()] ||
+    config.subjectConfigs["sejarah"] || {
+      language: "Bahasa Malaysia",
+      instructions: "",
+      mode: "mcq",
+      feedbacks: [],
+      prompts: { generate: "generate_quiz.txt" },
+    };
+
+  // Re-fetch topic data from Neo4j
+  const topicData = await getTopicWithQuestions(topicName);
+
+  const question = parseQuestionFromLog(q);
+
+  const ctx: DialogueContext = {
+    question,
+    studentAnswer,
+    topic: topicName,
+    topicText: topicData.text,
+    examQuestions: topicData.examQuestions,
+    subjectInstructions: subjectConfig.instructions,
+    sessionId,
+  };
 
   // Determine correctness
   let correct = 0;
-  if (isMcq(state.question) && state.question.correctAnswer?.toUpperCase() === state.studentAnswer?.toUpperCase()) {
+  if (isMcq(question) && question.correctAnswer?.toUpperCase() === studentAnswer?.toUpperCase()) {
     correct = 1;
   }
 
   // Unified feedback loop
-  const recall = getActiveRecall(state.sessionId);
+  const recall = getActiveRecall(sessionId);
   const feedbacks: { instructor: string; text: string }[] = [];
 
   for (const fb of subjectConfig.feedbacks) {
@@ -484,22 +530,50 @@ async function completeSessionAndGetResult(
       continue;
     }
     if (text) {
-      saveFeedback(state.sessionId, fb, text);
+      saveFeedback(sessionId, fb, text);
       feedbacks.push({ instructor: fb, text });
     }
   }
 
-  // Save question log
-  saveQuestionLog(state.sessionId, {
-    seq: 1,
-    topic: state.topic.name,
-    question: state.question,
-    studentAnswer: state.studentAnswer,
-  });
+  // Evaluate score + calculate EMA
+  let score = 0;
+  let ema = 0;
+  try {
+    score = await evaluateScore(ctx, feedbacks);
+    console.error(JSON.stringify({
+      t: new Date().toISOString(),
+      event: "score",
+      session_id: sessionId,
+      user_id: userId,
+      topic: topicName,
+      score,
+      source: "llm",
+    }));
+    const history = getScoreHistory(userId, topicName);
+    history.push({ score });
 
-  completeSession(state.sessionId, { total: 1, answered: 1, correct });
+    ema = history[0].score;
+    for (let i = 1; i < history.length; i++) {
+      ema = history[i].score * 0.3 + ema * 0.7;
+    }
+    ema = Math.round(ema * 100) / 100;
 
-  state.status = "complete";
+    saveMasteryLog(userId, topicName, sessionId, score);
+  } catch {
+    console.error(JSON.stringify({
+      t: new Date().toISOString(),
+      event: "score",
+      session_id: sessionId,
+      user_id: userId,
+      topic: topicName,
+      score: 0,
+      source: "fallback",
+    }));
+  }
+
+  // question_log already saved in handleGetQuestion — no need to save here
+  completeSession(sessionId, { total: 1, answered: 1, correct });
+  updateSessionStatus(sessionId, "complete");
 
   return {
     completed: true,
@@ -507,6 +581,8 @@ async function completeSessionAndGetResult(
     mode: subjectConfig.mode,
     feedbacks,
     summary: { total: 1, answered: 1, correct },
+    score,
+    ema,
   };
 }
 
@@ -638,9 +714,9 @@ process.on("SIGTERM", async () => {
 
 // --- Exports for testing ---
 export {
-  sessions,
   sessionId,
   shuffle,
+  parseQuestionFromLog,
   completeSessionAndGetResult,
   asToolResponse,
   asErrorResponse,

@@ -53,7 +53,24 @@ export function initDb(): void {
       text             TEXT NOT NULL,
       created_at       TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS mastery_log (
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id          TEXT NOT NULL,
+      topic            TEXT NOT NULL,
+      session_id       TEXT NOT NULL REFERENCES sessions(id),
+      score            REAL NOT NULL,
+      created_at       TEXT NOT NULL
+    );
   `);
+
+  // Add status/rounds/system_prompt columns to sessions if missing
+  const sessCols = db.prepare("PRAGMA table_info(sessions)").all() as { name: string }[];
+  if (!sessCols.some((c) => c.name === "status")) {
+    db.exec("ALTER TABLE sessions ADD COLUMN status TEXT NOT NULL DEFAULT 'awaiting-answer'");
+    db.exec("ALTER TABLE sessions ADD COLUMN rounds INTEGER NOT NULL DEFAULT 0");
+    db.exec("ALTER TABLE sessions ADD COLUMN system_prompt TEXT NOT NULL DEFAULT ''");
+  }
 
   migrateFromLegacy();
 }
@@ -165,6 +182,18 @@ export function createSession(
     VALUES (?, ?, ?, ?, '{}')
   `);
   stmt.run(sessionId, userId || 'cli', subject, new Date().toISOString());
+}
+
+export function updateSessionStatus(sessionId: string, status: string): void {
+  db.prepare("UPDATE sessions SET status = ? WHERE id = ?").run(status, sessionId);
+}
+
+export function updateSessionRounds(sessionId: string, rounds: number): void {
+  db.prepare("UPDATE sessions SET rounds = ? WHERE id = ?").run(rounds, sessionId);
+}
+
+export function updateStudentAnswer(sessionId: string, answer: string): void {
+  db.prepare("UPDATE question_logs SET student_answer = ? WHERE session_id = ?").run(answer, sessionId);
 }
 
 export function checkSession(sessionId: string, userId: string): boolean {
@@ -320,6 +349,18 @@ export function getFeedbacks(sessionId: string): { instructor: string; text: str
       "SELECT instructor, text FROM feedback WHERE session_id = ? ORDER BY id"
     )
     .all(sessionId) as { instructor: string; text: string }[];
+}
+
+export function saveMasteryLog(userId: string, topic: string, sessionId: string, score: number): void {
+  db.prepare(
+    "INSERT INTO mastery_log (user_id, topic, session_id, score, created_at) VALUES (?, ?, ?, ?, ?)"
+  ).run(userId, topic, sessionId, score, new Date().toISOString());
+}
+
+export function getScoreHistory(userId: string, topic: string): { score: number }[] {
+  return db.prepare(
+    "SELECT score FROM mastery_log WHERE user_id = ? AND topic = ? ORDER BY created_at ASC"
+  ).all(userId, topic) as { score: number }[];
 }
 
 // Run init on import
